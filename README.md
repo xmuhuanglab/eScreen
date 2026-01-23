@@ -1,15 +1,12 @@
 <p align="center">
-  <img src="https://github.com/kps333/eScreen-beta/blob/main/img/lab_logo.png" height="100" title="lab_logo">
-  <img src="https://github.com/kps333/eScreen-beta/blob/main/img/eScreen_logo.png" height="100" title="project_logo">
+  <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/lab_logo.png" height="100" title="lab_logo">
+  <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/eScreen_logo.png" height="100" title="project_logo">
 </p>
 
 # eScreen-beta
 eScreen is a sequence-sensitive model built upon the Striped Hyena2 architecture designed to learn interpretable regulatory context model from CRISPR perturbation experiment. Using the results of CRISPR perturbation experiment analysis and information about transcriptional factor motif, eScreen learns functional regulatory syntax and predicts regulatory activity of cis-regulatory elements.
 <p align="center" style="margin-bottom: 0px;">
-  <img src="https://github.com/kps333/eScreen-beta/blob/main/img/Schema_0.png" width="400" title="logo">
-</p>
-<p align="center" style="margin-top: 0px;">
-  <img src="https://github.com/kps333/eScreen-beta/blob/main/img/Schema_1.png" width="400" title="logo">
+  <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/Schema_0.png" width="400" title="logo">
 </p>
 
 This repository contains the official implementation of the model described in our paper:<br>Decoding the functional regulatory syntax at single-nucleotide resolution through deep learning and genome-scale perturbation.
@@ -124,8 +121,8 @@ p,y = model.predict(valid_loader,device='cuda',verbose=True,with_true=True)
 ## Demo
 | Name | Description |
 |-----------------|-------------|
-|[Demo.ipynb](https://github.com/kps333/eScreen-beta/blob/main/Tutorial/Demo.ipynb)|A detailed tutorial on how to Train `eScreen` and use it to predict the activity of regulatory elements|
-|[Analysis.ipynb](https://github.com/kps333/eScreen-beta/blob/main/Analysis/Analysis.ipynb)|A demo on how to reproduce some results in our paper|
+|[Demo.ipynb](https://github.com/xmuhuanglab/eScreen/blob/main/Tutorial/Demo.ipynb)|A detailed tutorial on how to Train `eScreen` and use it to predict the activity of regulatory elements|
+|[Analysis.ipynb](https://github.com/xmuhuanglab/eScreen/blob/main/Analysis/Analysis.ipynb)|A demo on how to reproduce some results in our paper|
 
 ## Data
 All demo used data can be gain in this repository. Model weights is available at Google Drive：xxxx
@@ -154,7 +151,7 @@ eScreen is a sequence-sensitive model built upon the Striped Hyena2 architecture
   ☛ An optional graph neural network (GNN) module that incorporates epigenetic context  
 
 <p align="center">
-  <img src="https://github.com/xmuhuanglab/eScreen/img/eScreen_fig2_2.png" width="600" title="logo">
+  <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/eScreen_fig2_1.png" width="600" title="logo">
 </p>
 
 ## License
