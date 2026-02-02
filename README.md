@@ -144,7 +144,7 @@ pip install -e .
 
 ## Model Architecture
 
-eScreen is a sequence-sensitive model built upon the Striped Hyena2 architecture, integrating:  
+eScreen is a sequence-sensitive model built upon the Striped Hyena 2 architecture, integrating:  
 
   ☛ Short- and long-range convolution layers for multi-scale regulatory feature extraction  
 
