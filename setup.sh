@@ -14,5 +14,6 @@ conda run -n eScreen bash -c '
     pip install ./flash-attn/flash_attn-2.7.3+cu11torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl --no-build-isolation --no-deps
     pip install ./flash-fft-conv/flashfftconv-0.0.0-py3-none-any.whl
     pip install ./flash-fft-conv/monarch_cuda-0.0.0-cp310-cp310-linux_x86_64.whl
+    pip install jupyter
     python -m ipykernel install --user --name eScreen
 '
