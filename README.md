@@ -132,7 +132,7 @@ All demo used data can be gain in this repository.
 We recommend using our packaged setup script to create suitable environment:
 ```bash
 git clone https://github.com/xmuhuanglab/eScreen.git
-cd eScreen-beta
+cd eScreen
 bash setup.sh
 conda activate eScreen
 ```
