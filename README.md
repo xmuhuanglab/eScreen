@@ -52,9 +52,9 @@ validset['one hot'] = None
 for i,row in tqdm(validset.iterrows(),total=len(validset)):
     validset.at[i,'one hot'] = escreen.genome_tool.one_hot(row['sequence'])
 
-train_ds = escreen.SequenceDataset(trainset, cell_type_dict, z_col_name='cell_line')
-test_ds  = escreen.SequenceDataset(testset , cell_type_dict, z_col_name='cell_line')
-valid_ds = escreen.SequenceDataset(validset, cell_type_dict, z_col_name='cell_line')
+train_ds = SequenceDataset(trainset, cell_type_dict, z_col_name='cell_line')
+test_ds  = SequenceDataset(testset , cell_type_dict, z_col_name='cell_line')
+valid_ds = SequenceDataset(validset, cell_type_dict, z_col_name='cell_line')
 
 train_loader = DataLoader(train_ds , batch_size=32)
 test_loader  = DataLoader(test_ds  , batch_size=32)
