@@ -19,7 +19,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from einops import rearrange
 import sys,copy,json
-
+from scipy.stats import spearmanr,pearsonr
 
 ########################
 # escreen architecture
