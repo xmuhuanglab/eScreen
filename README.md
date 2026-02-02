@@ -125,7 +125,7 @@ p,y = model.predict(valid_loader,device='cuda',verbose=True,with_true=True)
 |[Analysis.ipynb](https://github.com/xmuhuanglab/eScreen/blob/main/Analysis/Analysis.ipynb)|A demo on how to reproduce some results in our paper|
 
 ## Data
-All demo used data can be gain in this repository. Model weights is available at Google Drive：xxxx
+All demo used data can be gain in this repository.
 
 ## Setup
 ### Requirements
