@@ -125,7 +125,7 @@ p,y = model.predict(valid_loader,device='cuda',verbose=True,with_true=True)
 |[Analysis.ipynb](https://github.com/xmuhuanglab/eScreen/blob/main/Analysis/Analysis.ipynb)|A demo on how to reproduce some results in our paper|
 
 ## Data
-All demo used data can be gain in this repository or google driver: https://drive.google.com/file/d/1ggN4Go3H5X0QWF2RzxznTVIda0bQ3fgC/view?usp=drive_link.
+All demo used data can be gain in this repository or google driver: [K562_demo_dataset.pkl](https://drive.google.com/file/d/1ggN4Go3H5X0QWF2RzxznTVIda0bQ3fgC/view?usp=drive_link).
 
 ## Setup
 ### Requirements
