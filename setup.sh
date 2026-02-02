@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # create environment
-conda env create -n eScreen -f escreen.yaml -y
+conda env create -n eScreen -f escreen.yaml
 conda run -n eScreen pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu118
 conda install -n eScreen -c nvidia cuda-nvcc cuda-cudart-dev -y
 
