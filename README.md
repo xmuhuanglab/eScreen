@@ -131,7 +131,7 @@ All demo used data can be gain in this repository. Model weights is available at
 ### Requirements
 We recommend using our packaged setup script to create suitable environment:
 ```bash
-git clone https://github.com/kps333/eScreen-beta.git
+git clone [https://github.com/xmuhuanglab/eScreen.git](https://github.com/xmuhuanglab/eScreen.git)
 cd eScreen-beta
 bash setup.sh
 conda activate eScreen
