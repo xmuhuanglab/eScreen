@@ -18,7 +18,7 @@ For more details read our manuscript or access our [web site](https://escreen.hu
   - [Quick Start](#quick-start)
   - [Detail Demo](#Demo)
   - [Data](#data)
-  - [Installation](#installation)
+  - [Setup](#Setup)
   - [Model Architecture](#model-architecture)
   - [License](#license)
   - [Citation](#citation)
