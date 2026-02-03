@@ -70,7 +70,6 @@ def get_value(data,bw,feature='profile',threshold=0.5,_filter_=True,_verbose_=Tr
                 element_counts = Counter(array)
                 most_common_element, most_common_count = element_counts.most_common(1)[0]
                 ok_array.append( (most_common_count <= (b - a) *threshold) | (most_common_count !=0 ) )
-                #ok_array.append( most_common_count <= (b - a) *threshold )
             except:
                 array_house.append( np.zeros(200) )
                 ok_array.append(1<0)
@@ -84,14 +83,14 @@ def get_value(data,bw,feature='profile',threshold=0.5,_filter_=True,_verbose_=Tr
     
     return data
 
-def ln(x): # 自然对数
+def ln(x):
     return np.log(x)/np.log(np.e)
 
-def lg(x): # 常用对数
+def lg(x):
     return np.log(x)/np.log(10)
 
 def sigmoid_normalization_point(array,s1=(0.0,0.3),s2=(-0.3,0.7)):
-    # 自定义通过任意两点的sigmoid函数
+
     e=2.71828
     
     x1,y1=s1
@@ -107,26 +106,14 @@ def sigmoid_normalization_point(array,s1=(0.0,0.3),s2=(-0.3,0.7)):
     return n_array
 
 def nonzero_mean(arr, axis):
-    """
-    计算输入数组沿指定维度非零元素的平均值。
-    
-    参数：
-    arr (np.ndarray): 输入的数组。
-    axis (int): 指定的维度。
-    
-    返回：
-    np.ndarray: 沿指定维度非零元素的平均值。
-    """
-    # 将数组中零值置为 NaN，这样均值计算时可以忽略
+
     arr_with_nan = np.where(arr != 0, arr, np.nan)
-    
-    # 计算非零元素的均值（忽略 NaN）
+
     mean_result = np.nanmean(arr_with_nan, axis=axis)
     
     return mean_result
 
 def norml(x):
-    # 最大-最小值归一化
     if isinstance(x, torch.Tensor):
         x = x.to('cpu')
         x = x.numpy()
@@ -136,7 +123,6 @@ def norml(x):
     return (x-x.min())/(x.max()-x.min())
 
 def safe_divide(a, b):
-    # 安全地进行除法操作
     a = np.array(a)
     b = np.array(b)
     result = np.zeros_like(a, dtype=np.float64)
@@ -147,7 +133,6 @@ def safe_divide(a, b):
     return result
 
 def safe_log(a, base=2):
-    # 安全地进行对数操作
     a = np.array(a)  
     result = np.zeros_like(a, dtype=np.float64)
     positive_mask = a > 0
@@ -157,15 +142,13 @@ def safe_log(a, base=2):
     return result
 
 def remove_overlap(df1, df2):
-    # 用来去除两个数据框中重叠的部分
-    overlap = pd.merge(df1, df2, how='inner') # 使用 merge 方法找到重叠部分
-    df1_non_overlap = df1[~df1.apply(tuple, 1).isin(overlap.apply(tuple, 1))] # 去除 df1 中与 df2 重叠的部分
-    df2_non_overlap = df2[~df2.apply(tuple, 1).isin(overlap.apply(tuple, 1))] # 去除 df2 中与 df1 重叠的部分
+    overlap = pd.merge(df1, df2, how='inner')
+    df1_non_overlap = df1[~df1.apply(tuple, 1).isin(overlap.apply(tuple, 1))]
+    df2_non_overlap = df2[~df2.apply(tuple, 1).isin(overlap.apply(tuple, 1))]
     return df1_non_overlap, df2_non_overlap
 
 
 def power_norm(data, max_val=10, gamma=0.424):
-    # 在两个方向上分别进行归一化操作
     abs_data = np.abs(data)
     scaled = (abs_data / max_val) ** gamma
     return np.clip(scaled, 0, 1)
