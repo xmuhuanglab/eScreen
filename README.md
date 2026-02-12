@@ -3,7 +3,7 @@
   <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/eScreen_logo.png" height="100" title="project_logo">
 </p>
 
-# eScreen-beta
+# eScreen
 eScreen is a sequence-sensitive model built upon the Striped Hyena2 architecture designed to learn interpretable regulatory context model from CRISPR perturbation experiment. Using the results of CRISPR perturbation experiment analysis and information about transcriptional factor motif, eScreen learns functional regulatory syntax and predicts regulatory activity of cis-regulatory elements.
 <p align="center" style="margin-bottom: 0px;">
   <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/eScreen_fig2_2.png" width="400" title="logo">
