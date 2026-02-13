@@ -1,4 +1,3 @@
-from pybedtools import BedTool
 from pyliftover import LiftOver
 import pyBigWig
 import pandas as pd
