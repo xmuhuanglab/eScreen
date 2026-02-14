@@ -179,7 +179,7 @@ This project is licensed under the MIT License.
 
 ## Citation
 
-If you use eScreen in your research, please cite our paper:
+If you use eScreen in your research, please cite our [paper](https://www.biorxiv.org/content/10.64898/2026.02.02.703403v1):
 
 Luo S, Lin L, Zhang H, et al. eScreen: a deep learning framework for functionally decoding the regulatory genome at single-nucleotide resolution[J]. bioRxiv, 2026: 2026.02. 02.703403.
 
