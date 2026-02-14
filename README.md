@@ -125,6 +125,7 @@ https://github.com/user-attachments/assets/4b8d2c6c-3730-43f1-85b1-b7e293fda9e7
 
 
 
+  
 How to run the demo:
 
 
@@ -132,7 +133,9 @@ https://github.com/user-attachments/assets/966cd5be-bcad-45fc-8c1f-a5a7e1d851eb
 
 
 
-
+### Time cost
+On our device (CPU: Intel Xeon Silver 4310, 24C/48T; GPU: A30 24GB), environment setup and demo execution take approximately 1466s (~24 mins) and 461s (~8 mins) respectively.  
+<img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/cost_time.png" height="200" title="cost_time">
 
 ## Demo
 | Name | Description |
@@ -176,7 +179,7 @@ This project is licensed under the MIT License.
 
 ## Citation
 
-If you use eScreen in your research, please cite our paper:
+If you use eScreen in your research, please cite our [paper](https://www.biorxiv.org/content/10.64898/2026.02.02.703403v1):
 
 Luo S, Lin L, Zhang H, et al. eScreen: a deep learning framework for functionally decoding the regulatory genome at single-nucleotide resolution[J]. bioRxiv, 2026: 2026.02. 02.703403.
 
