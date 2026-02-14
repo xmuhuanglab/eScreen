@@ -126,11 +126,8 @@ How to install `eScreen` and the dependent environment:
 ```
 
 How to run the demo:
-```HTML
-<video style="width:800px; height:450px;" controls>
-    <source src="https://github.com/xmuhuanglab/eScreen/blob/main/vedio/eScreen_demo.mp4" type="video/mp4">
-</video>
-```
+https://github.com/xmuhuanglab/eScreen/blob/main/vedio/eScreen_demo.mp4
+
 ```HTML
 <video width="320" height="240" controls>
     <source src="movie.mp4" type="video/mp4">
