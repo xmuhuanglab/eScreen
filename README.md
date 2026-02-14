@@ -134,7 +134,7 @@ https://github.com/user-attachments/assets/966cd5be-bcad-45fc-8c1f-a5a7e1d851eb
 
 ### Time cost
 On our device (CPU: Intel Xeon Silver 4310, 24C/48T; GPU: A30 24GB), environment setup and demo execution take approximately 1466s (~24 mins) and 461s (~8 mins) respectively.  
-<img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/cost_time.png" height="200" margin-left:"200" title="cost_time">
+<img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/cost_time.png" height="200" title="cost_time">
 
 ## Demo
 | Name | Description |
