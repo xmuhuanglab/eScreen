@@ -183,5 +183,5 @@ Luo S, Lin L, Zhang H, et al. eScreen: a deep learning framework for functionall
 ## Contact
 
 For questions or support, please open an issue or contact us. Please don't hesitate to contact us if you have any questions or suggestions about eScreen:
-<br>[21620241153548@stu.xmu.edu.cn](mailto:21620241153548@stu.xmu.edu.cn).
-<br>[sluo112211@163.com](mailto:sluo112211@163.com).
+<br>Liquan Lin: [21620241153548@stu.xmu.edu.cn](mailto:21620241153548@stu.xmu.edu.cn).
+<br>Shijie Luo: [sluo112211@163.com](mailto:sluo112211@163.com).
