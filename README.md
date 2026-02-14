@@ -119,12 +119,12 @@ p,y = model.predict(valid_loader,device='cuda',verbose=True,with_true=True)
 ``` 
 ### Vedio tutorial
 How to install `eScreen` and the dependent environment:
-<video style="margin-left:350px; width:800px; height:450px;" controls>
+<video style="width:800px; height:450px;" controls>
     <source src="https://github.com/xmuhuanglab/eScreen/blob/main/vedio/eScreen_install.mp4" type="video/mp4">
 </video>
 
 How to run the demo:
-<video style="margin-left:350px; width:800px; height:450px;" controls>
+<video style="width:800px; height:450px;" controls>
     <source src="https://github.com/xmuhuanglab/eScreen/blob/main/vedio/eScreen_demo.mp4" type="video/mp4">
 </video>
 
