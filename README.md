@@ -141,7 +141,9 @@ On our device (CPU: Intel Xeon Silver 4310, 24C/48T; GPU: A30 24GB), environment
 | Name | Description |
 |-----------------|-------------|
 |[Demo.ipynb](https://github.com/xmuhuanglab/eScreen/blob/main/Tutorial/Demo.ipynb)|A detailed tutorial on how to Train `eScreen` and use it to predict the activity of regulatory elements|
-|[Analysis.ipynb](https://github.com/xmuhuanglab/eScreen/blob/main/Analysis/Analysis.ipynb)|A demo on how to reproduce some results in our paper|
+|[Figure3.ipynb](https://github.com/xmuhuanglab/eScreen/blob/main/Analysis/Figure3.ipynb)|Notebook to reproduce key results of figure 3 in our paper|
+|[Figure4.ipynb](https://github.com/xmuhuanglab/eScreen/blob/main/Analysis/Figure4.ipynb)|Notebook to reproduce key results of figure 4 in our paper|
+|[Figure5.ipynb](https://github.com/xmuhuanglab/eScreen/blob/main/Analysis/Figure5.ipynb)|Notebook to reproduce key results of figure 5 in our paper|
 
 ## Data
 All demo used data can be gain in this repository.
