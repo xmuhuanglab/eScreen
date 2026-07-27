@@ -1,0 +1,18 @@
+Gene_set	Term	Overlap	P-value	Adjusted P-value	Old P-value	Old Adjusted P-value	Odds Ratio	Combined Score	Genes
+GO_Biological_Process_2025	Hematopoietic Stem Cell Differentiation (GO:0060218)	3/9	5.142252e-05	1.186053e-03	0	0	5.829706e+01	5.757088e+02	HOXB4;MEOX1;BATF
+GO_Biological_Process_2025	Hematopoietic Progenitor Cell Differentiation (GO:0002244)	4/28	9.412873e-05	1.928491e-03	0	0	1.952959e+01	1.810558e+02	HOXB4;MEOX1;MIXL1;BATF
+GO_Biological_Process_2025	T-helper Cell Differentiation (GO:0042093)	3/23	9.917524e-04	1.290380e-02	0	0	1.747676e+01	1.208700e+02	LEF1;MYB;BATF
+GO_Biological_Process_2025	Regulation of Vascular Associated Smooth Muscle Cell Differentiation (GO:1905063)	2/6	1.090678e-03	1.290380e-02	0	0	5.796199e+01	3.953562e+02	NFATC3;NFATC1
+GO_Biological_Process_2025	Hemopoiesis (GO:0030097)	5/101	1.854188e-03	1.690806e-02	0	0	6.117001e+00	3.847783e+01	MEIS1;MYB;NKX2-5;MEIS3;MIXL1
+GO_Biological_Process_2025	Response to Interleukin-4 (GO:0070670)	2/9	2.573280e-03	2.078418e-02	0	0	3.311612e+01	1.974573e+02	LEF1;TCF7
+GO_Biological_Process_2025	Regulation of Macrophage Derived Foam Cell Differentiation (GO:0010743)	3/32	2.623651e-03	2.098921e-02	0	0	1.204746e+01	7.160035e+01	NR1H2;NR1H3;PPARA
+GO_Biological_Process_2025	Regulation of Type II Interferon-Mediated Signaling Pathway (GO:0060334)	2/12	4.637908e-03	3.141809e-02	0	0	2.317778e+01	1.245456e+02	NR1H2;NR1H3
+GO_Biological_Process_2025	Cellular Response to Interleukin-4 (GO:0071353)	2/13	5.450136e-03	3.442191e-02	0	0	2.106964e+01	1.098174e+02	LEF1;TCF7
+GO_Biological_Process_2025	Regulation of Hematopoietic Progenitor Cell Differentiation (GO:1901532)	2/17	9.289807e-03	5.067168e-02	0	0	1.544795e+01	7.227846e+01	MYB;MIXL1
+GO_Biological_Process_2025	Myeloid Cell Differentiation (GO:0030099)	3/57	1.322522e-02	6.421496e-02	0	0	6.461765e+00	2.795120e+01	MAF;MYB;KLF1
+GO_Biological_Process_2025	Dendritic Cell Differentiation (GO:0097028)	2/23	1.670598e-02	7.585420e-02	0	0	1.103091e+01	4.513836e+01	BATF3;BATF
+GO_Biological_Process_2025	Regulation of Cytokine Production (GO:0001817)	5/172	1.701728e-02	7.685222e-02	0	0	3.503707e+00	1.427244e+01	HIC2;ZBTB32;SNAI2;PATZ1;BATF
+GO_Biological_Process_2025	Regulation of Cell Differentiation (GO:0045595)	5/201	3.072548e-02	1.147084e-01	0	0	2.980898e+00	1.038146e+01	SMAD2;LEF1;SNAI2;KLF4;TCFL5
+GO_Biological_Process_2025	Positive Regulation of Granulocyte Differentiation (GO:0030854)	1/5	4.251218e-02	1.337625e-01	0	0	2.881250e+01	9.098886e+01	LEF1
+GO_Biological_Process_2025	Positive Regulation of Hemoglobin Biosynthetic Process (GO:0046985)	1/5	4.251218e-02	1.337625e-01	0	0	2.881250e+01	9.098886e+01	KLF4
+GO_Biological_Process_2025	Positive Thymic T Cell Selection (GO:0045059)	1/5	4.251218e-02	1.337625e-01	0	0	2.881250e+01	9.098886e+01	NFATC3

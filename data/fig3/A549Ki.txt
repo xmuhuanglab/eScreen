@@ -1,0 +1,6 @@
+Gene_set	Term	Overlap	P-value	Adjusted P-value	Old P-value	Old Adjusted P-value	Odds Ratio	Combined Score	Genes
+GO_Biological_Process_2025	Regulation of Epidermal Cell Differentiation (GO:0045604)	3/18	1.466980e-03	3.276291e-01	0	0	1.559605e+01	1.017572e+02	ERRFI1;MAFG;ZFP36L1
+GO_Biological_Process_2025	Regulation of Epithelial Cell Differentiation (GO:0030856)	3/21	2.324270e-03	3.861194e-01	0	0	1.299473e+01	7.880458e+01	CAV1;MAFG;SOX9
+GO_Biological_Process_2025	Positive Regulation of Endothelial Cell Migration (GO:0010595)	4/88	2.649249e-02	4.950580e-01	0	0	3.715042e+00	1.348892e+01	RRAS;AKT3;ETS1;FOXP1
+GO_Biological_Process_2025	Endothelial Cell Development (GO:0001885)	2/24	3.743645e-02	4.950580e-01	0	0	7.058697e+00	2.318860e+01	PDE4D;RAPGEF1
+GO_Biological_Process_2025	Cellular Response to Epidermal Growth Factor Stimulus (GO:0071364)	2/28	4.959893e-02	4.950580e-01	0	0	5.971532e+00	1.793721e+01	SOX9;ZFP36L1

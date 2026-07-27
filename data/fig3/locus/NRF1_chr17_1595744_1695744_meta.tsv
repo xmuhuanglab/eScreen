@@ -1,0 +1,2 @@
+tf	gene	chr	locus_start	locus_end	n_cre	n_chip_raw_bp	chip_bin_bp	chip_bigwig	peak_cre_id	gradient_pdf
+NRF1	SCARF1	chr17	1595744	1695744	35	100000	200	/cluster/huanglab/sluo/sluoo/escreen/phase_p0_bundle/chip_data/K562/NRF1.bigWig	EH38E3203008	fig1_NRF1_EH38E3203008.pdf

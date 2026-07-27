@@ -1,0 +1,2 @@
+tf	gene	chr	locus_start	locus_end	n_cre	n_chip_raw_bp	chip_bin_bp	chip_bigwig
+MXI1	HSPD1	chr2	197400613	197600613	80	200000	200	/cluster/huanglab/sluo/sluoo/escreen/phase_p0_bundle/chip_data/K562/MXI1.bigWig

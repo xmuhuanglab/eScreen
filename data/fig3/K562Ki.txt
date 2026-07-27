@@ -1,0 +1,6 @@
+Gene_set	Term	Overlap	P-value	Adjusted P-value	Old P-value	Old Adjusted P-value	Odds Ratio	Combined Score	Genes
+GO_Biological_Process_2025	Positive Regulation of Blood Vessel Endothelial Cell Migration (GO:0043536)	4/50	1.335170e-02	4.350752e-01	0	0	4.678930e+00	2.019478e+01	ANXA1;ATP5F1B;AKT3;HDAC7
+GO_Biological_Process_2025	Erythrocyte Development (GO:0048821)	2/12	1.972727e-02	4.383553e-01	0	0	1.072240e+01	4.209352e+01	NEMP1;ZBTB7A
+GO_Biological_Process_2025	Granulocyte Differentiation (GO:0030851)	2/12	1.972727e-02	4.383553e-01	0	0	1.072240e+01	4.209352e+01	TAL1;SRP54
+GO_Biological_Process_2025	Regulation of Monocyte Differentiation (GO:0045655)	2/15	3.026834e-02	5.101579e-01	0	0	8.246742e+00	2.884424e+01	FOXP1;ZFP36L1
+GO_Biological_Process_2025	Myeloid Leukocyte Differentiation (GO:0002573)	4/74	4.752268e-02	5.349428e-01	0	0	3.070958e+00	9.355820e+00	CDC42;SRP54;GAB2;FOXP1
