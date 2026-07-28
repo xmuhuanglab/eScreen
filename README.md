@@ -121,7 +121,7 @@ p,y = model.predict(valid_loader,device='cuda',verbose=True,with_true=True)
 How to install `eScreen` and the dependent environment:
 
 
-https://github.com/user-attachments/assets/4b8d2c6c-3730-43f1-85b1-b7e293fda9e7
+coming soon
 
 
 
@@ -129,13 +129,12 @@ https://github.com/user-attachments/assets/4b8d2c6c-3730-43f1-85b1-b7e293fda9e7
 How to run the demo:
 
 
-https://github.com/user-attachments/assets/966cd5be-bcad-45fc-8c1f-a5a7e1d851eb
+coming soon
 
 
 
 ### Time cost
-On our device (CPU: Intel Xeon Silver 4310, 24C/48T; GPU: A30 24GB), environment setup and demo execution take approximately 1466s (~24 mins) and 461s (~8 mins) respectively.  
-<img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/cost_time.png" height="200" title="cost_time">
+On our device (CPU: Intel Xeon Silver 4310, 24C/48T; GPU: A30 24GB), environment setup and demo execution take approximately 3 hours and ~8 mins respectively.  
 
 ## Demo
 | Name | Description |
