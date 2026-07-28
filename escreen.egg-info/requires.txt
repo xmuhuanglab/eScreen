@@ -1,0 +1,11 @@
+torch>=2.0
+numpy
+einops
+tqdm
+scikit-learn
+scipy
+pandas
+pyBigWig
+pyfaidx
+pyliftover
+transformers

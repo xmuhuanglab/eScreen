@@ -40,6 +40,8 @@ scipy==1.15.3
 seaborn==0.13.2
 six==1.17.0
 stack-data==0.6.3
+streamlit>=1.28
+captum>=0.6.0
 sympy==1.13.1
 threadpoolctl==3.6.0
 tqdm==4.67.1

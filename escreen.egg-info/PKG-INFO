@@ -1,0 +1,33 @@
+Metadata-Version: 2.4
+Name: escreen
+Version: 0.1.0
+Summary: Using Deep Learning to screen functional cis-regulatory elements in silico
+Home-page: https://github.com/xmuhuanglab/eScreen
+Author: Liquan Lin, Shijie Luo
+Author-email: 21620241153548@stu.xmu.edu.cn, sluo112211@163.com
+License: MIT
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.10
+License-File: LICENSE
+Requires-Dist: torch>=2.0
+Requires-Dist: numpy
+Requires-Dist: einops
+Requires-Dist: tqdm
+Requires-Dist: scikit-learn
+Requires-Dist: scipy
+Requires-Dist: pandas
+Requires-Dist: pyBigWig
+Requires-Dist: pyfaidx
+Requires-Dist: pyliftover
+Requires-Dist: transformers
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
