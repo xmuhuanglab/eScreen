@@ -135,7 +135,6 @@ eScreen is a sequence-sensitive model built upon the Striped Hyena 2 architectur
 
   ☛ Short- and long-range convolution layers for multi-scale regulatory feature extraction  
 
-  ☛ An optional graph neural network (GNN) module that incorporates epigenetic context  
 
 <p align="center">
   <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/Schema_4.png" width="1000" title="logo">
