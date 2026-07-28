@@ -6,7 +6,7 @@
 # eScreen
 eScreen is a sequence-sensitive model built upon the Striped Hyena2 architecture designed to learn interpretable regulatory context model from CRISPR perturbation experiment. Using the results of CRISPR perturbation experiment analysis and information about transcriptional factor motif, eScreen learns functional regulatory syntax and predicts regulatory activity of cis-regulatory elements.
 <p align="center" style="margin-bottom: 0px;">
-  <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/eScreen_fig2_2.png" width="400" title="logo">
+  <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/Schema_3.png" width="1000" title="logo">
 </p>
 
 This repository contains the official implementation of the model described in our paper:<br>Decoding the functional regulatory syntax at single-nucleotide resolution through deep learning and genome-scale perturbation.
@@ -27,101 +27,68 @@ For more details read our manuscript or access our [web site](https://escreen.hu
 ## Quick Start
 ### Load demo dataset
 ```python
-import escreen
-import pickle,json
-from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+import pickle
 
-with open('../data/celltype.dict','rb') as file:
-    cell_type_dict = json.load(file)
+with open(f"../data/train.pkl", "rb") as f:
+    trainset = pickle.load(f)
+with open(f"../data/valid.pkl", "rb") as f:
+    validset = pickle.load(f)
+with open(f"../data/test.pkl", "rb") as f:
+    testset = pickle.load(f)
 
-with open('../data/demo_dataset.pkl','rb') as file:
-    Demo_Dataset = pickle.load(file)
-    
-trainset = Demo_Dataset['Trainset'].reset_index(drop=True)
-testset  = Demo_Dataset['Testset'].reset_index(drop=True)
-validset = Demo_Dataset['Validset'].reset_index(drop=True)
-
-trainset['one hot'] = None
-for i,row in tqdm(trainset.iterrows(),total=len(trainset)):
-    trainset.at[i,'one hot'] = escreen.genome_tool.one_hot(row['sequence'])
-testset['one hot'] = None
-for i,row in tqdm(testset.iterrows(),total=len(testset)):
-    testset.at[i,'one hot']  = escreen.genome_tool.one_hot(row['sequence'])
-validset['one hot'] = None
-for i,row in tqdm(validset.iterrows(),total=len(validset)):
-    validset.at[i,'one hot'] = escreen.genome_tool.one_hot(row['sequence'])
-
-train_ds = SequenceDataset(trainset, cell_type_dict, z_col_name='cell_line')
-test_ds  = SequenceDataset(testset , cell_type_dict, z_col_name='cell_line')
-valid_ds = SequenceDataset(validset, cell_type_dict, z_col_name='cell_line')
-
-train_loader = DataLoader(train_ds , batch_size=32)
-test_loader  = DataLoader(test_ds  , batch_size=32)
-valid_loader = DataLoader(valid_ds , batch_size=32)
+# Decode compact indices back to one-hot for the model
+for ds in [trainset, validset, testset]:
+    ds["sequence"] = np.eye(4, dtype=np.uint8)[ds["sequence"]]
 ```
 ### Train
 ```python
-import torch
+optimizer = AdamW([
+    {"params": model.output_MoE.parameters(), "lr": 1e-3},
+    {"params": model.output_header.parameters(), "lr": 3e-4},
+    {"params": model.cls_head.parameters(), "lr": 3e-4},
+    {
+        "params": [
+            p for n, p in model.named_parameters()
+            if "output_MoE" not in n and "output_header" not in n and "cls_head" not in n
+        ],
+        "lr": 1e-3,
+    },
+], lr=1e-3, weight_decay=0.01)
 
-motifs_f, motifs_r, motif_names, motif_length = escreen.motif_tool.load_pwm_from_meme_c(
-    "../data/Vierstra637motifs.meme", max_length=35
+def val_score_fn(model, val_data, device):
+    preds, _ = model.predict(val_data, batch_size=384, device=device, verbose=False, with_true=False)
+    return m2a_combo_score(preds, val_data["y"], val_data)
+
+save_name = "./model/model"
+if not os.path.exists("./model"):
+    os.makedirs("./model",exist_ok=True)
+
+model.fit(
+    trainset, val_data=validset, batch_size=256, epochs=50, optimizer=optimizer, check_step=500,
+    earlystop=12, use_boost=True, t=0.45, task="reg", device=DEVICE, save_name=save_name, 
+    aux_bce_lambda=0.6, aux_loss_type="bce", focal_gamma=2.0, pos_weight=30.0, label_smoothing=0.0,
+     max_grad_norm=1.0, sampler="label_boost", val_score_fn=val_score_fn
 )
-seed = 114514
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-kernel_fwd  = torch.tensor(motifs_f,dtype=torch.float)
-kernel_rev  = torch.tensor(motifs_r,dtype=torch.float)
-d_in = None
-d_model = 512
-num_filters = 512
-
-model = escreen.eScreen(
-    kernel_fwd = kernel_fwd,
-    kernel_rev = kernel_rev,
-    d_model=d_model,
-    num_filters=num_filters,
-    seq_length=500,
-    celltype_num=32,
-    lr=1e-5,
-    device='cuda',
-)
-
-torch.cuda.empty_cache()
-model.fit(train_loader,valid_loader=test_loader,epochs=50,lr=1e-4,check_step=500,earlystop=10,device='cuda',save_name='./eScreen_model')
 ```
 
 ### Prediction
 ```python
-motifs_f, motifs_r, motif_names, motif_length = escreen.motif_tool.load_pwm_from_meme_c(
-    "../data/Vierstra637motifs.meme", max_length=35
-)
-seed = 114514
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-kernel_fwd  = torch.tensor(motifs_f,dtype=torch.float)
-kernel_rev  = torch.tensor(motifs_r,dtype=torch.float)
-d_in = None
-d_model = 512
-num_filters = 512
+from tqdm import tqdm
 
-model = escreen.eScreen(
-    kernel_fwd = kernel_fwd,kernel_rev = kernel_rev,d_model=d_model,
-    num_filters=num_filters,seq_length=500,celltype_num=32,lr=1e-5,device='cuda',
+# Load best checkpoint and evaluate on test set
+model.load_state_dict(
+    torch.load("./model/model.best.pt", map_location=DEVICE, weights_only=False),
+    strict=False,
 )
 
-model.load_state_dict( torch.load('./eScreen_model.best.pt',map_location='cuda') )
-p,y = model.predict(valid_loader,device='cuda',verbose=True,with_true=True)
+preds, y_true = model.predict(testset, batch_size=384, device=DEVICE, verbose=True, with_true=True)
+
 ``` 
 ### Vedio tutorial
 How to install `eScreen` and the dependent environment:
 
 
-https://github.com/user-attachments/assets/4b8d2c6c-3730-43f1-85b1-b7e293fda9e7
+coming soon
 
 
 
@@ -129,13 +96,12 @@ https://github.com/user-attachments/assets/4b8d2c6c-3730-43f1-85b1-b7e293fda9e7
 How to run the demo:
 
 
-https://github.com/user-attachments/assets/966cd5be-bcad-45fc-8c1f-a5a7e1d851eb
+coming soon
 
 
 
 ### Time cost
-On our device (CPU: Intel Xeon Silver 4310, 24C/48T; GPU: A30 24GB), environment setup and demo execution take approximately 1466s (~24 mins) and 461s (~8 mins) respectively.  
-<img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/cost_time.png" height="200" title="cost_time">
+On our device (CPU: Intel Xeon Silver 4310, 24C/48T; GPU: A30 24GB), environment setup and demo execution take approximately 3 hours and ~8 mins respectively.  
 
 ## Demo
 | Name | Description |
@@ -169,10 +135,9 @@ eScreen is a sequence-sensitive model built upon the Striped Hyena 2 architectur
 
   ☛ Short- and long-range convolution layers for multi-scale regulatory feature extraction  
 
-  ☛ An optional graph neural network (GNN) module that incorporates epigenetic context  
 
 <p align="center">
-  <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/eScreen_fig2_1.png" width="600" title="logo">
+  <img src="https://github.com/xmuhuanglab/eScreen/blob/main/img/Schema_4.png" width="1000" title="logo">
 </p>
 
 ## License
