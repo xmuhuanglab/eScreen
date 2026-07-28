@@ -64,9 +64,10 @@ if not os.path.exists("./model"):
     os.makedirs("./model",exist_ok=True)
 
 model.fit(
-    trainset, val_data=validset, batch_size=256, epochs=50, optimizer=optimizer, check_step=500, earlystop=12,
-    use_boost=True, t=0.45, task="reg", device=DEVICE, save_name=save_name, aux_bce_lambda=0.6, aux_loss_type="bce",
-    focal_gamma=2.0, pos_weight=30.0, label_smoothing=0.0, max_grad_norm=1.0, sampler="label_boost", val_score_fn=val_score_fn
+    trainset, val_data=validset, batch_size=256, epochs=50, optimizer=optimizer, check_step=500,
+    earlystop=12, use_boost=True, t=0.45, task="reg", device=DEVICE, save_name=save_name, aux_bce_lambda=0.6,
+    aux_loss_type="bce", focal_gamma=2.0, pos_weight=30.0, label_smoothing=0.0, max_grad_norm=1.0,
+    sampler="label_boost", val_score_fn=val_score_fn
 )
 ```
 
