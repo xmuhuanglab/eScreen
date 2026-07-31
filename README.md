@@ -84,21 +84,6 @@ model.load_state_dict(
 preds, y_true = model.predict(testset, batch_size=384, device=DEVICE, verbose=True, with_true=True)
 
 ``` 
-### Vedio tutorial
-How to install `eScreen` and the dependent environment:
-
-
-coming soon
-
-
-
-  
-How to run the demo:
-
-
-coming soon
-
-
 
 ### Time cost
 On our device (CPU: Intel Xeon Silver 4310, 24C/48T; GPU: A30 24GB), environment setup and demo execution take approximately 3 hours and ~8 mins respectively.  
