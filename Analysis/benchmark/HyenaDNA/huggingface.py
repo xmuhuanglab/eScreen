@@ -75,9 +75,31 @@ class HyenaDNAPreTrainedModel(PreTrainedModel):
     base_model_prefix = "hyenadna"
 
     def __init__(self, config):
+        """Leave the base-class initialisation to the subclass.
+
+        ``PreTrainedModel.__init__`` is deliberately not called: subclasses attach
+        their own ``self.model`` after construction, so there is nothing to set up
+        yet.  Constructing this class on its own yields an object with no ``model``
+        attribute.
+        """
         pass
 
     def forward(self, input_ids, **kwargs):
+        """Run the underlying HyenaDNA model.
+
+        Parameters
+        ----------
+        input_ids : torch.Tensor
+            Token ids, ``[B, L]``.
+        **kwargs
+            Forwarded unchanged to the backbone.
+
+        Returns
+        -------
+        torch.Tensor
+            Backbone output: logits when ``use_head`` was set, hidden states
+            otherwise.
+        """
         return self.model(input_ids, **kwargs)
 
     @classmethod
@@ -91,6 +113,44 @@ class HyenaDNAPreTrainedModel(PreTrainedModel):
                         n_classes=2,
                       ):
         # first check if it is a local path
+        """Load a HyenaDNA checkpoint, locally or from HuggingFace.
+
+        Parameters
+        ----------
+        path : str
+            Directory holding (or to hold) the checkpoint.
+        model_name : str
+            Variant name, e.g. ``'tiny-1k-d256'``.
+        download : bool, default False
+            When the local directory is absent, clone the weights from
+            ``https://huggingface.co/LongSafari/<model_name>`` using git-lfs.
+        config : dict, optional
+            Model configuration; read from ``config.json`` when omitted.
+        device : str, default 'cpu'
+            Device passed to ``torch.load``.
+        use_head : bool, default False
+            Whether to attach the classification head.
+        n_classes : int, default 2
+            Number of classes for that head.
+
+        Returns
+        -------
+        HyenaDNAModel
+            The model with pretrained weights applied.
+
+        Notes
+        -----
+        Loading takes two steps because the checkpoint stores its keys under a
+        ``model.`` prefix that the freshly built module does not use:
+        :func:`load_weights` rewrites the prefixes and, when the checkpoint was
+        trained with gradient checkpointing, injects an extra ``.layer`` segment.
+        A key that cannot be resolved raises rather than leaving a randomly
+        initialised weight in place.
+
+        When ``download`` is true the destination directory is removed first
+        (``rm -rf`` through a shell), which is destructive - point ``path`` at a
+        scratch directory.
+        """
         pretrained_model_name_or_path = os.path.join(path, model_name)
         if os.path.isdir(pretrained_model_name_or_path) and download == False:
             if config is None:

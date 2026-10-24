@@ -36,6 +36,17 @@ class HyenaDNA1Head(nn.Module):
     """HyenaDNA backbone + single output head."""
 
     def __init__(self, backbone, d_model, freeze_backbone=True):
+        """Build the shared trunk and the single output head.
+
+        Parameters
+        ----------
+        backbone : HyenaDNAModel
+            Pretrained encoder.
+        d_model : int
+            Hidden width of the backbone.
+        freeze_backbone : bool, default True
+            Whether to hold the encoder fixed and train only the head.
+        """
         super().__init__()
         self.backbone = backbone
         self.d_model = d_model
@@ -50,6 +61,8 @@ class HyenaDNA1Head(nn.Module):
         self._apply_freezing()
 
     def _apply_freezing(self):
+        """Freeze or unfreeze the encoder, including its batch-norm statistics.
+        """
         for p in self.backbone.parameters():
             p.requires_grad = not self.freeze_backbone
         for m in self.backbone.modules():
@@ -59,6 +72,18 @@ class HyenaDNA1Head(nn.Module):
                     m.eval()
 
     def forward(self, x):
+        """Score one batch.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Token ids, ``[B, L]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Scores, ``[B]``, obtained from the final position's hidden state.
+        """
         hidden = self.backbone(x)
         emb = hidden[:, -1, :]
         emb = self.shared(emb)
@@ -66,6 +91,33 @@ class HyenaDNA1Head(nn.Module):
 
 
 def build_hyenadna(model_name='tiny-1k-d256', device='cpu'):
+    """Instantiate a HyenaDNA backbone and load its pretrained weights.
+
+    Parameters
+    ----------
+    model_name : str, default 'tiny-1k-d256'
+        Variant directory name under ``pretrained_model/``.
+    device : str, default 'cpu'
+        Device to place the model on.
+
+    Returns
+    -------
+    backbone : HyenaDNAModel
+        The loaded encoder.
+    d_model : int
+        Its hidden width, read from the checkpoint config.
+
+    Notes
+    -----
+    The checkpoint directory is hard-coded to an absolute cluster path
+    (``/cluster2/huanglab/...``); change it before running elsewhere.
+
+    The saved state dict is prefixed with ``model.``, so that prefix is
+    stripped before loading.  ``strict=False`` tolerates any remaining key
+    mismatch, which means a partially incompatible checkpoint loads silently
+    with some weights left at their initial values - verify the load if the
+    resulting AUROC looks like chance.
+    """
     model_path = f'/cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/HyenaDNA/pretrained_model/{model_name}/'
     with open(model_path + 'config.json', 'r') as f:
         config = json.load(f)
@@ -220,6 +272,14 @@ def train_hyenadna_facs(cell_line, device='cuda:0', model_name='tiny-1k-d256',
 
 
 def main():
+    """Command-line entry point for the FACS readout benchmark.
+
+    Trains and evaluates the HyenaDNA baseline on the FACS-derived labels of one
+    cell line (Supplementary Methods section 5.5), then prints its AUROC.
+
+    Defaults: ``epochs=50``, ``batch_size=32``, ``lr=5e-3``, ``earlystop=10``,
+    frozen backbone, output under ``./FACS_benchmark/HyenaDNA``.
+    """
     parser = argparse.ArgumentParser(description='HyenaDNA FACS training')
     parser.add_argument('--cell_line', default='K562', choices=['K562', 'hPSC'])
     parser.add_argument('--device', default='cuda:0')

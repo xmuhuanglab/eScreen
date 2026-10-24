@@ -56,6 +56,24 @@ class HyenaDNA5Head(nn.Module):
 
     def __init__(self, backbone, d_model, cell_type_num=16, num_heads=5,
                  freeze_backbone=True, use_cell_emb=False):
+        """Build the shared trunk and the five per-cell-line heads.
+
+        Parameters
+        ----------
+        backbone : HyenaDNAModel
+            Pretrained encoder.
+        d_model : int
+            Hidden width of the backbone.
+        cell_type_num : int, default 16
+            Size of the cell-type embedding table.
+        num_heads : int, default 5
+            One head per benchmark cell line (K562, HepG2, HT29, hPSC, A375).
+        freeze_backbone : bool, default True
+            Whether to hold the encoder fixed and train only the head stack.
+        use_cell_emb : bool, default False
+            Concatenate a learned cell-type embedding to the sequence embedding
+            instead of relying on the per-cell-line heads alone.
+        """
         super().__init__()
         self.backbone = backbone
         self.d_model = d_model
@@ -88,6 +106,11 @@ class HyenaDNA5Head(nn.Module):
         self._apply_freezing()
 
     def _apply_freezing(self):
+        """Freeze or unfreeze the encoder according to ``freeze_backbone``.
+
+        Batch-norm statistics are disabled and the modules pinned to eval mode while
+        frozen, so a frozen encoder does not keep shifting its running means.
+        """
         for p in self.backbone.parameters():
             p.requires_grad = not self.freeze_backbone
         for m in self.backbone.modules():
@@ -99,6 +122,28 @@ class HyenaDNA5Head(nn.Module):
     def forward(self, x, ct=None):
         # x: (B, L) token IDs
         # HyenaDNA returns (B, L, d_model) hidden states
+        """Score a batch for every cell line at once.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Token ids, ``[B, L]``.
+        ct : torch.Tensor, optional
+            Cell-type indices, needed only when ``use_cell_emb`` is set.
+
+        Returns
+        -------
+        torch.Tensor
+            Logits, ``[B, num_heads]``, one column per cell line.
+
+        Notes
+        -----
+        The sequence summary is the hidden state of the final position, which for
+        HyenaDNA carries the aggregated context of the whole window.  Because every
+        head is evaluated on every sample, the caller selects the column matching
+        each sample's own cell line; one forward pass therefore yields a prediction
+        for all five labels without re-running the backbone.
+        """
         hidden = self.backbone(x)  # (B, L, d_model)
         # Use last token's embedding ([SEP]/[EOS] token)
         seq_emb = hidden[:, -1, :]  # (B, d_model)
@@ -157,7 +202,24 @@ def prepare_tokens(data_dict):
 
 
 class HyenaDataset(torch.utils.data.Dataset):
+    """Dataset pairing token ids with their binary labels.
+
+    Each item carries the token sequence, the label, and the index of the cell
+    line the sample came from.  That index is what selects the matching head
+    when the loss is computed.  With cell-type conditioning enabled the
+    cell-type id is returned as well.
+    """
     def __init__(self, data_dict, use_cell_emb=False):
+        """Wrap a pre-tokenised split.
+
+        Parameters
+        ----------
+        data_dict : dict
+            Must contain ``'token'``, ``'label'`` and ``'cell_line_idx'``; also
+            ``'cell_type'`` when ``use_cell_emb`` is true.
+        use_cell_emb : bool, default False
+            Whether to also yield the cell-type id.
+        """
         self.seq = prepare_tokens(data_dict)
         self.labels = torch.tensor(data_dict['label'], dtype=torch.float)
         self.cl_idx = torch.tensor(data_dict['cell_line_idx'], dtype=torch.long)
@@ -166,9 +228,20 @@ class HyenaDataset(torch.utils.data.Dataset):
             self.ct = torch.tensor(data_dict['cell_type'], dtype=torch.long)
 
     def __len__(self):
+        """Number of samples in the split.
+        """
         return len(self.labels)
 
     def __getitem__(self, idx):
+        """Return one sample.
+
+        Returns
+        -------
+        tuple
+            ``(tokens, label, cell_line_idx)``, or
+            ``(tokens, label, cell_line_idx, cell_type)`` when cell-type
+            conditioning is enabled.
+        """
         if self.use_cell_emb:
             return self.seq[idx], self.labels[idx], self.cl_idx[idx], self.ct[idx]
         return self.seq[idx], self.labels[idx], self.cl_idx[idx]
@@ -177,6 +250,29 @@ class HyenaDataset(torch.utils.data.Dataset):
 # ── Training ────────────────────────────────────────────────────────
 @torch.no_grad()
 def predict(model, data_dict, batch_size, device, use_cell_emb=False):
+    """Run inference over a whole split and collect per-sample predictions.
+
+    The head matching each sample's own cell line is selected, so the returned
+    vector is directly comparable to the labels.
+
+    Parameters
+    ----------
+    model : HyenaDNA5Head
+        Trained model.
+    data_dict : dict
+        Split to score.
+    batch_size : int
+        Inference batch size.
+    device : torch.device
+        Device to run on.
+    use_cell_emb : bool, default False
+        Whether the model expects a cell-type input.
+
+    Returns
+    -------
+    numpy.ndarray
+        Scores, ``[N]``.
+    """
     model.eval()
     all_preds = []
     seq = prepare_tokens(data_dict).to(device)
@@ -201,6 +297,18 @@ def predict(model, data_dict, batch_size, device, use_cell_emb=False):
 
 # ── Main ────────────────────────────────────────────────────────────
 def main():
+    """Command-line entry point for the five-head benchmark.
+
+    Runs the full pipeline: build the locus-aware splits, train with early
+    stopping on the validation set, then report test metrics.  This is the
+    HyenaDNA baseline of Supplementary Methods section 6.2.3.
+
+    Defaults are ``epochs=50``, ``batch_size=32``, ``lr=5e-3``,
+    ``weight_decay=0.0``, ``earlystop=10`` and ``check_step=2000``.  The
+    backbone is frozen by default, so only the heads are trained - the
+    fine-tuning regime used for the comparison.  Checkpoints are written under
+    ``--output_dir`` (default ``./Models``).
+    """
     parser = argparse.ArgumentParser(description='HyenaDNA — 5-head finetuning')
     parser.add_argument('--device', default='cuda:0', help='GPU device, e.g. cuda:0')
     parser.add_argument('--model', default='tiny-1k-d256',

@@ -150,16 +150,64 @@ class eScreen_FACS(nn.Module):
     """
 
     def __init__(self, backbone, d_model=256):
+        """Wrap a pre-built encoder and attach the scalar head.
+
+        Parameters
+        ----------
+        backbone : nn.Module
+            Encoder returning ``(B, d_model)`` sequence-level embeddings.
+        d_model : int, default 256
+            Embedding width the backbone is expected to produce.
+        """
         super().__init__()
         self.backbone = backbone
         self.head = nn.Linear(d_model, 1)
 
     def forward(self, x):
+        """Score a batch of one-hot CRE windows.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            One-hot DNA ``(B, 512, 4)``, float32; the encoder casts to
+            bfloat16 internally. Base order is A, C, G, T.
+
+        Returns
+        -------
+        torch.Tensor
+            Raw logits of shape ``(B,)``; apply ``sigmoid`` for probabilities.
+        """
         emb = self.backbone(x)  # (B, d_model)
         return self.head(emb).flatten()
 
     @torch.no_grad()
     def predict(self, data, batch_size=256, device='cpu', verbose=True):
+        """Run batched inference over a dict-style dataset split.
+
+        Parameters
+        ----------
+        data : dict
+            Split returned by ``load_facs_for_cell_line`` with keys
+            ``'sequence'`` (``(N, 512, 4)`` one-hot, NumPy), ``'label'``
+            (``(N,)`` in {0, 1}) and ``'length'`` (``N``).
+        batch_size : int, default 256
+            Number of windows per forward pass.
+        device : str, default 'cpu'
+            Torch device string; callers pass the training device.
+        verbose : bool, default True
+            Show a ``tqdm`` progress bar.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``float32`` logits of shape ``(N,)`` in input order; never
+            sigmoid-ed here.
+
+        Notes
+        -----
+        ``torch.no_grad`` keeps the activation graph of the Hyena blocks off
+        the GPU, which is what makes a single pass over the whole split fit.
+        """
         self.eval()
         preds = []
         indices = range(0, data['length'], batch_size)
@@ -403,6 +451,8 @@ def train_facs(cell_line, device='cuda:0', epochs=50, batch_size=256,
                'n_pos': int(y_true.sum()), 'n_neg': int((1 - y_true).sum())}
     pd.DataFrame([metrics]).to_csv(f'{save_name}_test_metrics.csv', index=False)
     with open(f'{save_name}_test_summary.txt', 'w') as f:
+    # A plain-text twin of the metrics CSV: same two numbers, no header,
+    # written for quick `grep`-ability of a single run's result.
         f.write(f'eScreen FACS - {cell_line}\n')
         f.write(f'AUROC={test_auroc:.6f}, AUPRC={test_auprc:.6f}\n')
 
@@ -411,6 +461,20 @@ def train_facs(cell_line, device='cuda:0', epochs=50, batch_size=256,
 
 
 def main():
+    """Parse CLI arguments, run :func:`train_facs`, print the test AUROC.
+
+    Returns
+    -------
+    None
+        The metric dict from :func:`train_facs` is only used for the final
+        one-line print; every artefact is written inside ``train_facs``.
+
+    Notes
+    -----
+    ``--cell_line`` is restricted to the two FACS cell lines of §5.5
+    (``K562``, ``hPSC``); ``--earlystop`` and ``--output_dir`` are forwarded
+    unchanged.
+    """
     parser = argparse.ArgumentParser(description='eScreen FACS training')
     parser.add_argument('--cell_line', default='K562', choices=['K562', 'hPSC'])
     parser.add_argument('--device', default='cuda:0')

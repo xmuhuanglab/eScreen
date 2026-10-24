@@ -313,6 +313,23 @@ def pad_to_4096(seq_np):
 
 
 class SeiDataset(torch.utils.data.Dataset):
+    """Map-style dataset that pads every window to 4,096 bp on load.
+
+    Padding is applied once in ``__init__``, so all items share the same
+    shape and the ``DataLoader`` needs no custom ``collate_fn``. The cost is
+    that the whole split is held at 4,096 bp even though the original
+    windows are 512 bp -- an 8x memory multiplier.
+
+    Parameters
+    ----------
+    data_dict : dict
+        Split with ``'sequence'`` ``(N, L, 4)``, ``'label'`` ``(N,)``,
+        ``'cell_line_idx'`` ``(N,)`` and, in regression mode, ``'y'``
+        ``(N,)``.
+    regression : bool, default False
+        When True the dataset yields the continuous ``'y'`` target instead of
+        the binarised ``'label'``.
+    """
     def __init__(self, data_dict, regression=False):
         """Materialise a split, padding every window up front.
 

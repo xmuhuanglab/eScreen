@@ -321,6 +321,7 @@ def train_nvwace_facs(cell_line, device='cuda:0', epochs=50, batch_size=64,
 
 
 def main():
+    """Parse CLI arguments, run :func:`train_nvwace_facs`, print the test AUROC."""
     parser = argparse.ArgumentParser(description='NVWACE FACS training')
     parser.add_argument('--cell_line', default='K562', choices=['K562', 'hPSC'])
     parser.add_argument('--device', default='cuda:0')
