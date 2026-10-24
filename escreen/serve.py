@@ -2,6 +2,54 @@
 eScreen GUI — Streamlit interface for prediction, interpretability, and training.
 Usage:
     python -m escreen.serve --hostname 0.0.0.0 --port 8501
+
+Interface surface (this module has no HTTP routes)
+-----------------------------------------------
+``serve.py`` is a **Streamlit** application, not a REST service: it defines no
+``@app.route``, no FastAPI/Flask handler and no JSON-over-HTTP endpoint.  What it
+exposes is a browser UI with three tabs, served by Streamlit's own websocket
+protocol on ``--port`` (default 8501):
+
+``Predict``
+    Widgets: file uploader (``bed``/``tsv``/``txt``; headerless TSV whose first
+    two columns are ``sequence`` and ``celltype``), ``Batch size`` number input
+    (8-512, default 128), ``Predict`` button.  On submit the uploaded table is
+    echoed with an extra ``prediction`` column and offered as
+    ``predictions.tsv``.  Backed by ``eScreen_vX.predict``.
+
+``Attribution``
+    Widgets: free-text ``DNA sequence`` (truncated to 512 bp), free-text
+    ``Cell type`` resolved by case-insensitive prefix matching against the known
+    cell lines (exact single match is used directly, several matches produce a
+    ``Suggestions`` selectbox, no match shows an error), ``Run attribution``
+    button.  Output: a line chart of per-nucleotide importance.  Backed by
+    Captum ``IntegratedGradients``.
+
+``Train``
+    Widgets: file uploader (TSV with ``sequence``, ``celltype``, ``label`` and an
+    optional 4th ``score`` column), an expander with ``Epochs``,
+    ``Learning rate``, ``Batch size``, ``Weight decay``, ``Task``
+    (``reg``/``cls``), ``Boost resampling``, ``Boost temperature``,
+    ``Early stop patience``, ``Aux BCE lambda``, ``Pos weight``, and a
+    ``Start training`` button.  On submit it calls ``eScreen_vX.fit`` and writes
+    ``data/finetuned_model.pt``.
+
+CLI
+---
+``python -m escreen.serve --hostname 0.0.0.0 --port 8501`` re-executes this file
+under ``streamlit run`` with ``_ESCREEN_SERVE=1`` in the environment; the
+module-level block guarded by that flag is the actual application, and importing
+the module has no side effects.
+
+Relation to the manuscript
+--------------------------
+Supplementary Methods section 8 describes the *deployed* eScreen web server: a
+Python web framework exposing RESTful API services, Tabix-indexed BED files for
+CRE predictions and transcripts, BigWig tracks fetched on demand, and gene /
+cCRE-ID / coordinate query modes over a 530,527-CRE compendium.  None of that is
+implemented in this file.  This module is the local GUI for running the model
+itself (predict, explain, fine-tune) and performs no indexed genomic retrieval;
+section 8 and this module are different artefacts.
 """
 import argparse
 import os
@@ -15,13 +63,42 @@ import pandas as pd
 import streamlit as st
 import torch
 
+# Repository root and bundled data directory.  Every artefact (MEME file,
+# checkpoint, Geneformer weights) is resolved relative to this, so the app can be
+# launched from any working directory.
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 
+# One-hot channel order used by every model in this package: A, C, G, T.
 BASE_MAP = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
 
 def one_hot_encode(seq: str, max_len: int = 512) -> np.ndarray:
+    """One-hot encode a DNA string into a fixed ``max_len`` x 4 uint8 matrix.
+
+    Parameters
+    ----------
+    seq : str
+        Nucleotide string.  Converted with ``.upper()`` and truncated to
+        ``max_len``.
+    max_len : int, default 512
+        Number of positions to allocate - the eScreen input width
+        (Supplementary Methods section 2.3.1: cCRE centre +/- 256 bp).
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(max_len, 4)``, dtype ``uint8``, channel order A, C, G, T.
+        Short sequences are zero-padded at the tail, so only the first
+        ``min(len(seq), max_len)`` rows are meaningful.
+
+    Notes
+    -----
+    Characters outside A/C/G/T - ``N``, IUPAC codes, whitespace - leave an
+    all-zero row rather than raising, matching the model's treatment of masked
+    bases.  Silent truncation means a sequence longer than 512 bp is accepted
+    without warning.
+    """
     arr = np.zeros((max_len, 4), dtype=np.uint8)
     for j, b in enumerate(seq.upper()[:max_len]):
         if b in BASE_MAP:
@@ -31,6 +108,44 @@ def one_hot_encode(seq: str, max_len: int = 512) -> np.ndarray:
 
 @st.cache_resource
 def init_model():
+    """Build the eScreen model, its PWM front end and its cell-type embeddings.
+
+    Cached with ``@st.cache_resource``, so the heavy objects are constructed once
+    per process and shared across reruns and browser sessions.
+
+    Returns
+    -------
+    model : escreen.model.eScreen_vX
+        Model on ``DEVICE`` in ``eval()`` mode, warm-started from
+        ``data/best_model.pt`` when that file exists.
+    DEVICE : str
+        ``'cuda'`` when available, otherwise ``'cpu'``.
+    token2GFcelltype : dict
+        Integer cell-type token -> cell-line name.
+    GFcelltype2token : dict
+        Cell-line name -> integer token (the inverse mapping).
+
+    Notes
+    -----
+    * Motif kernels come from ``data/consensus_pwms.meme`` via
+      ``escreen.motif.load_pwm_from_meme_c(..., max_length=35)``, i.e. the
+      forward/reverse-complement PWM pairs padded to 35 bp described in
+      Supplementary Methods section 2.3.6, assigned as the frozen Conv1d weights.
+    * Cell-type conditioning uses the Geneformer embeddings of
+      ``data/DepMap_CellLine_embedding.pkl`` (mean-pooled DepMap bulk RNA-seq,
+      Supplementary Methods section 2.3.5) plus the Geneformer V1-10M model and
+      its 30M gene dictionaries under ``data/geneformer/``.
+    * ``num_filters=256`` is the width of the learnable projection applied to the
+      motif activations; the number of motif channels itself is implied by the
+      PWM tensor (1,274 filters), not by this argument.
+    * ``load_state_dict(..., strict=False)`` tolerates missing and extra keys
+      silently, so a mismatched checkpoint degrades to partly random weights with
+      no warning.  Inspect the returned ``_IncompatibleKeys`` if that matters.
+    * All ``freeze_*`` flags are False, so the loaded model stays fully trainable:
+      right for the Train tab, slower than a frozen encoder for pure inference.
+    * ``DEVICE`` is chosen here, not by the caller, and is returned so the rest of
+      the app can move tensors consistently.
+    """
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     d_model = 256
 
@@ -38,11 +153,15 @@ def init_model():
     from escreen.motif import load_pwm_from_meme_c
     from escreen.CellEmb import Geneformer
 
+    # Motif kernels: forward and reverse-complement PWMs padded to 35 bp - the
+    # fixed Conv1d weights of Supplementary Methods section 2.3.6.
     meme_file = str(DATA_DIR / "consensus_pwms.meme")
     motifs_f, motifs_r, _, _ = load_pwm_from_meme_c(meme_file, max_length=35)
     kernel_fwd = torch.tensor(motifs_f, dtype=torch.float)
     kernel_rev = torch.tensor(motifs_r, dtype=torch.float)
 
+    # Geneformer cell-type embeddings (Supplementary Methods section 2.3.5) and
+    # the name <-> token maps used to condition every forward pass.
     with open(DATA_DIR / "DepMap_CellLine_embedding.pkl", "rb") as f:
         GF_predefined_emb, GFcelltype2token = pickle.load(f)
     GF_predefined_emb = torch.stack(GF_predefined_emb)
@@ -76,6 +195,8 @@ def init_model():
         freeze_celllora=False, freeze_header=False,
     ).to(DEVICE)
 
+    # Optional warm start from the shipped checkpoint; strict=False tolerates
+    # architecture drift instead of failing.
     ckpt = DATA_DIR / "best_model.pt"
     if ckpt.exists():
         model.load_state_dict(
@@ -88,6 +209,34 @@ def init_model():
 
 
 def df_to_data(df: pd.DataFrame, ct2idx: dict, seq_len: int = 512):
+    """Convert a sequence/cell-type table into the dict the model consumes.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must have ``sequence`` and ``celltype`` columns.
+    ct2idx : dict
+        Cell-line name -> integer token.  Mutated in place: unseen names are
+        appended with index ``len(ct2idx)``.
+    seq_len : int, default 512
+        One-hot width per sequence.
+
+    Returns
+    -------
+    data : dict
+        ``{'sequence': ndarray (n, seq_len, 4) uint8, 'cell_type': ndarray (n,)
+        int32, 'length': n}`` - exactly the layout ``eScreen_vX.predict`` and
+        ``.fit`` index into.
+    ct2idx : dict
+        The (possibly extended) name -> token mapping.
+
+    Notes
+    -----
+    Both call sites pass a fresh ``{}``, so tokens are assigned in
+    first-appearance order instead of matching the Geneformer token ids: the
+    cell-type conditioning is then arbitrary unless the uploaded names happen to
+    line up.  Pass ``token2GFcelltype`` to reuse the pretrained mapping.
+    """
     seqs = []
     cts = []
     for _, row in df.iterrows():
@@ -104,6 +253,48 @@ def df_to_data(df: pd.DataFrame, ct2idx: dict, seq_len: int = 512):
 
 
 def run_attribute(model, seqs, ct_indices, device, batch_size=8):
+    """Integrated Gradients attributions, reduced to one score per nucleotide.
+
+    Implements the attribution of Supplementary Methods section 3.2: all-zero
+    baseline, Gauss-Legendre numerical integration with 30 steps, then the
+    completeness step (attribution multiplied element-wise by the input).
+
+    Parameters
+    ----------
+    model : eScreen_vX
+        Model whose ``forward(x, ct)`` returns one scalar per sample.  Set to
+        ``eval()`` here regardless of the caller's state.
+    seqs : numpy.ndarray
+        One-hot input, shape ``(n, 512, 4)``; cast to float32 on ``device``.
+    ct_indices : numpy.ndarray
+        Cell-type tokens, shape ``(n,)``, passed as
+        ``additional_forward_args``.
+    device : str
+        Torch device.
+    batch_size : int, default 8
+        Sequences per IG call; the cost is ``n_steps`` forward/backward passes
+        per batch.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(n, 512)``, float32.  Each entry is the sum over the four
+        nucleotide channels of ``attribution * input``; because the input is
+        one-hot, only the channel of the present base contributes, so the value
+        is that base's signed importance.
+
+    Notes
+    -----
+    * The convergence delta returned by Captum is discarded: nothing checks that
+      the 30-step Gauss-Legendre approximation converged.
+    * No CRE-internal normalisation is applied here.  The paper's
+      ``norm_mean`` (motif-interval mean divided by whole-CRE mean,
+      Supplementary Methods section 3.3.2) belongs downstream.
+    * ``eScreen_vX.forward`` accepts ``(x, ct, return_cls, return_emb)``, so IG
+      explains the default regression output (``return_cls=False``).
+    * Memory scales with ``batch_size`` because gradients are retained on the
+      expanded interpolation batch.
+    """
     from captum.attr import IntegratedGradients
     model.eval()
     ig = IntegratedGradients(model.forward)
@@ -112,17 +303,45 @@ def run_attribute(model, seqs, ct_indices, device, batch_size=8):
     for i in range(0, n, batch_size):
         bx = torch.tensor(seqs[i:i + batch_size], dtype=torch.float, device=device).requires_grad_()
         bc = torch.tensor(ct_indices[i:i + batch_size], dtype=torch.int, device=device)
+        # IG from the all-zero baseline with Gauss-Legendre quadrature over 30
+        # steps: Supplementary Methods section 3.2.
         bl = torch.zeros_like(bx)
         attr, _ = ig.attribute(
             bx, baselines=bl, additional_forward_args=bc,
             return_convergence_delta=True, method="gausslegendre", n_steps=30,
         )
+        # Completeness step: attribution x input, summed over the 4 channels.
         score = (attr.detach().cpu().numpy() * bx.detach().cpu().numpy()).sum(axis=-1)
         all_attr.append(score)
     return np.concatenate(all_attr, axis=0)
 
 
 def main():
+    """CLI entry point: relaunch this file under ``streamlit run``.
+
+    The function does not serve anything itself.  It re-invokes the current
+    interpreter with ``-m streamlit run <this file>``, forwarding the host and
+    port and forcing headless mode, and exports ``_ESCREEN_SERVE=1`` so that the
+    module-level app block executes in the child process.  This double-launch is
+    what lets ``python -m escreen.serve`` behave like a single command.
+
+    Parameters
+    ----------
+    (none)
+        Parsed from ``argv``: ``--hostname`` (default ``0.0.0.0``) and
+        ``--port`` (default ``8501``).
+
+    Returns
+    -------
+    None
+        Blocks until the Streamlit child process exits.
+
+    Notes
+    -----
+    ``subprocess.run`` is called without ``check=True``, so a failing Streamlit
+    child leaves the parent with a zero exit status - scripted callers cannot
+    detect a crashed server from the return code.
+    """
     parser = argparse.ArgumentParser(description="eScreen GUI")
     parser.add_argument("--hostname", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8501)
@@ -130,6 +349,8 @@ def main():
 
     env = os.environ.copy()
     env["_ESCREEN_SERVE"] = "1"
+    # Re-exec under `streamlit run`; the environment flag below makes the
+    # module-level block execute in the child process only.
     subprocess.run([
         sys.executable, "-m", "streamlit", "run", __file__,
         "--server.address", args.hostname,
@@ -138,15 +359,26 @@ def main():
     ], env=env)
 
 
+# ---------------------------------------------------------------------------
+# Streamlit app body.  Executes only in the child process started by main(),
+# which is why importing escreen.serve has no side effects.  Structure: one
+# cached model (init_model), then three tabs - Predict, Attribution, Train.
+# Streamlit reruns this whole block on every widget interaction.
+# ---------------------------------------------------------------------------
 if os.environ.get("_ESCREEN_SERVE") == "1":
     st.set_page_config(page_title="eScreen", layout="wide")
     st.title("eScreen — functional CRE screening")
 
+# Build the model once per process: the checkpoint load and Geneformer init are
+# the expensive part, so they must not re-run per widget.
     model, DEVICE, token2celltype, celltype2token = init_model()
     known_celltypes = sorted(celltype2token.keys())
 
+# Three tabs, one per entry point of the package: inference, attribution and
+# fine-tuning.
     tab_pred, tab_attr, tab_train = st.tabs(["Predict", "Attribution", "Train"])
 
+    # ---- Predict: (sequence, celltype) rows -> activity score -------------
     with tab_pred:
         st.subheader("Predict regulatory activity")
         pred_file = st.file_uploader(
@@ -157,6 +389,8 @@ if os.environ.get("_ESCREEN_SERVE") == "1":
         pred_btn = st.button("Predict", key='pred_btn')
 
         if pred_btn and pred_file is not None:
+            # Headerless TSV: the first two columns are taken as
+            # sequence/celltype, everything else in the file is ignored.
             df = pd.read_csv(pred_file, sep='\t', header=None).iloc[:, :2]
             df.columns = ['sequence', 'celltype']
             ct2idx = {}
@@ -168,6 +402,7 @@ if os.environ.get("_ESCREEN_SERVE") == "1":
             csv = out.to_csv(index=False, sep='\t')
             st.download_button("Download results", csv, "predictions.tsv")
 
+    # ---- Attribution: Integrated Gradients over one 512 bp sequence ------
     with tab_attr:
         st.subheader("Attribution (Integrated Gradients)")
         col1, col2 = st.columns([3, 1])
@@ -183,6 +418,10 @@ if os.environ.get("_ESCREEN_SERVE") == "1":
             )
             attr_ct = None
             if attr_ct_input:
+                # Case-insensitive prefix match against the known cell lines;
+                # ambiguous prefixes must be disambiguated before running.
+                # 'attr_ct' stays None when nothing matches, which disables the
+                # button's effect below.
                 matches = [c for c in known_celltypes
                            if attr_ct_input.lower() in c.lower()]
                 if not matches:
@@ -208,6 +447,7 @@ if os.environ.get("_ESCREEN_SERVE") == "1":
             st.line_chart(df_attr.set_index('position'))
             st.caption("Per-nucleotide importance (sum across 4 channel × gradient)")
 
+    # ---- Train: fine-tune the loaded checkpoint on a labelled table ------
     with tab_train:
         st.subheader("Fine-tune eScreen")
         train_file = st.file_uploader(
@@ -235,6 +475,9 @@ if os.environ.get("_ESCREEN_SERVE") == "1":
         if train_btn and train_file is not None:
             df = pd.read_csv(train_file, sep='\t', header=None)
             ncol = df.shape[1]
+            # Layout: sequence, celltype, label[, score].  'score' (continuous)
+            # becomes the regression target; 'label' (binary) drives the
+            # auxiliary BCE head and the boosted sampler.
             if ncol < 3:
                 st.error("Need at least 3 columns: sequence, celltype, label")
                 st.stop()
@@ -246,6 +489,11 @@ if os.environ.get("_ESCREEN_SERVE") == "1":
             has_score = 'score' in df.columns
             ct2idx = {}
             data, ct2idx = df_to_data(df, ct2idx)
+            # Regression target: the continuous score when present, otherwise
+            # the binary label cast to float.
+            # has_binary gates the auxiliary classification target: a label
+            # column with more than two distinct values cannot supervise BCE and
+            # is then used only through 'y'.
             data['y'] = df['score'].values.astype(np.float32) if has_score else df['label'].values.astype(np.float32)
             has_binary = df['label'].dropna().nunique() <= 2
             if has_binary:
@@ -254,6 +502,8 @@ if os.environ.get("_ESCREEN_SERVE") == "1":
             opt = torch.optim.AdamW(model.parameters(), lr=float(train_lr), weight_decay=float(train_wd))
 
             model.train()
+            # fit() owns the boosting sampler, the smooth-L1 + auxiliary BCE
+            # composite loss, per-epoch checkpointing and early stopping.
             model.fit(
                 train_data=data,
                 batch_size=int(train_bs),
@@ -269,6 +519,7 @@ if os.environ.get("_ESCREEN_SERVE") == "1":
                 pos_weight=float(pos_weight) if pos_weight > 0 else None,
             )
             st.success("Training done!")
+            # Persist the fine-tuned weights next to the shipped checkpoint.
             torch.save(model.state_dict(), str(DATA_DIR / "finetuned_model.pt"))
 
 elif __name__ == "__main__":
