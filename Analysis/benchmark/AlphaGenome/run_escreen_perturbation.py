@@ -11,6 +11,56 @@ Pipeline (from AlphaGenome_20260527.0.ipynb):
 
 Usage:
     python run_escreen_perturbation.py
+
+What this script implements
+---------------------------
+The AlphaGenome in silico perturbation arm of Supplementary Methods §6.2.2, run
+on the eScreen benchmark test set: for every held-out CRE, a 1 Mb window centred
+on the CRE summit is submitted three times to the hosted AlphaGenome API — once
+unperturbed (WT), once with the central 512 bp replaced by ``N`` (MASK), and once
+with the central 512 bp shuffled (SHUFFLE) — requesting the CAGE output head for
+the sample's cell-line ontology term.
+
+Deviations from the manuscript, stated plainly
+----------------------------------------------
+* §6.2.2 describes the perturbation readout as the **RNA-seq** tracks; this code
+  requests **CAGE** (``OutputType.CAGE`` in ``alphagenome_common``). §5.5
+  describes the same perturbation experiment with a CAGE readout, so the code
+  follows §5.5. The manuscript is internally inconsistent here.
+* §6.2.2 says the *absolute* difference between WT and perturbed output is used;
+  the score computed downstream is the **signed** sum ``sum(WT - ALT)``.
+* §5.5 specifies a 1 Mb window "centred on the CRE summit" and a central 512 bp
+  perturbation; both are implemented exactly.
+
+AlphaGenome is not vendored here: inference goes through the ``alphagenome``
+package against the hosted API (hard-coded keys in ``alphagenome_common``). No
+local checkpoint is used.
+
+Expected on disk
+----------------
+``data/p0_filtered_samples.csv`` (input)
+    eScreen benchmark table; only rows with ``split == 'test'`` are used, and
+    ``start``/``end`` must be the CRE interval on hg38 (0-based, half-open) so
+    that the summit can be computed as ``(start + end) // 2``.
+``data/hg38.fa`` (input)
+    Indexed hg38 for :mod:`pyfaidx`.
+``data/AlphaGenome_CAGE_output_eScreenTest_1.h5`` (output)
+    ``/cage/<id>@<cell_line>/{wt,mask,shuffle}`` (``float16`` per CAGE bin) with
+    attributes ``chromosome``, ``start``, ``end``, ``cell_line``. Written in
+    append mode, so the script is resumable by re-running it.
+
+Order of use: run this script first, then ``evaluate_escreen_scores.py``.
+
+Notes on the run
+----------------
+* The per-sample ``float16`` CAGE vector is ``(n_bins,)`` — the CAGE tracks are
+  collapsed with ``.sum(axis=1)`` before storage, so all per-track information is
+  discarded and only the per-bin total survives.
+* The HDF5 attribute here is called ``chromosome`` (this file) whereas
+  ``run_facs_perturbation.py`` writes ``chr``. Consumers must match the producer;
+  ``analyze_facs_scores.py`` reads ``chr`` and would fail on a file written here.
+* ``CheckpointManager`` is imported but never instantiated: resumption is driven
+  entirely by the groups already present in the HDF5. The import is dead.
 """
 import os
 import time
@@ -27,7 +77,35 @@ from alphagenome_common import (
 
 
 def build_cre_list(csv_path='data/p0_filtered_samples.csv'):
-    """Load the CRE list (test split only), build a 1 Mb window per CRE."""
+    """Load the CRE list (test split only), build a 1 Mb window per CRE.
+
+    Parameters
+    ----------
+    csv_path : str, optional
+        eScreen benchmark table exported by ``export_p0_samples.py``. Must have
+        ``split``, ``start``, ``end``, ``cell_line`` and ``id``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The test rows with two added columns, ``begin`` and ``stop``: the
+        0-based half-open bounds of a 1,048,576 bp window centred on the CRE
+        summit. ``begin`` can be negative and ``stop`` can exceed the chromosome
+        length — ``alphagenome_common.prepare_sequences_fast`` clips and pads.
+
+    Notes
+    -----
+    * The summit is approximated by the interval midpoint
+      ``(start + end) // 2``. Supplementary Methods §5.5 says "centred on the CRE
+      summit"; the true summit (the DNase/ATAC max) is not stored in this table,
+      so the midpoint is used instead. For a 512 bp window this shifts the
+      perturbed bases by at most a few hundred bp relative to a true summit.
+    * ``HALF = 1048576 // 2`` is a *flank* of 524,288 bp, so the resulting window
+      is exactly 1,048,576 bp long and the perturbation offsets in
+      ``alphagenome_common`` (centred on 524,288) land on the CRE midpoint.
+    * Only the test split is used, matching the held-out evaluation in
+      Supplementary Methods §6.1.
+    """
     cre_list = pd.read_csv(csv_path)
     cre_list = cre_list[cre_list['split'] == 'test']
     HALF = 1048576 // 2
@@ -39,7 +117,39 @@ def build_cre_list(csv_path='data/p0_filtered_samples.csv'):
 
 
 def save_results_flat(h5file, results, global_idx, skip_existing=True):
-    """Save results to HDF5 (one group per sample: wt/mask/shuffle + metadata)."""
+    """Save results to HDF5 (one group per sample: wt/mask/shuffle + metadata).
+
+    Parameters
+    ----------
+    h5file : h5py.File
+        Open file in append mode; a ``cage`` group must already exist.
+    results : list of tuple
+        Output of ``alphagenome_common.process_batch_parallel``:
+        ``(sample_id, wt_cage, mask_cage, shuffle_cage, row)``.
+    global_idx : list of one int
+        Mutable counter (a one-element list, used as a poor man's ``nonlocal``)
+        incremented per sample actually written.
+    skip_existing : bool, optional
+        If True, groups that already exist are left untouched — this is the
+        resume guard, and it makes the function idempotent for a partially
+        written batch.
+
+    Returns
+    -------
+    int
+        Number of samples newly written (``0`` for an entirely duplicated
+        batch).
+
+    Notes
+    -----
+    * Datasets are stored without compression: the arrays are small and the run
+      is API-latency bound, so CPU spent on compression would only slow it down.
+    * ``attrs['chromosome']`` is this file's spelling; the FACS runner writes
+      ``attrs['chr']`` instead. Note the asymmetry when reading either file.
+    * ``rw.id``/``rw.cell_line`` are read as Series attributes (pandas resolves
+      them against the column names), which requires those columns to exist and
+      not clash with Series methods.
+    """
     cage_group = h5file['cage']
 
     saved_count = 0
@@ -66,7 +176,49 @@ def save_results_flat(h5file, results, global_idx, skip_existing=True):
 
 def main(cre_list, hg38, chrom_len, model1, model2, model3,
          filepath='data/AlphaGenome_CAGE_output_eScreenTest_1.h5'):
-    """Main loop: predict WT/MASK/SHUFFLE per batch into HDF5, resumable."""
+    """Main loop: predict WT/MASK/SHUFFLE per batch into HDF5, resumable.
+
+    Parameters
+    ----------
+    cre_list : pandas.DataFrame
+        Test-split rows with ``begin``/``stop`` (see :func:`build_cre_list`).
+    hg38 : pyfaidx.Fasta
+        Indexed hg38.
+    chrom_len : dict of str to int
+        Chromosome lengths.
+    model1, model2, model3 : DnaClient
+        Clients bound to the three API keys (WT / MASK / SHUFFLE).
+    filepath : str, optional
+        Output HDF5; opened in append mode when it already exists.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    * **Resumption** is derived from the HDF5 itself: existing group keys give
+      the set of finished samples, and only the remaining row indices are
+      batched. The checkpoint machinery living in ``alphagenome_common`` is not
+      used here (the import is dead code), so deleting the HDF5 restarts the run.
+    * **Batching** is done BY CELL LINE. The loop breaks a batch whenever
+      ``cell_line`` changes, which is required because
+      ``process_batch_parallel`` takes the ontology term from the first row of
+      the batch and assumes the whole batch shares it. A consequence is that the
+      final batch of each cell line can be smaller than ``BATCH_SIZE``, and
+      ``row['cell_line'] != current_cell_line`` is only checked *before* appending
+      the current row, so the very first row of a new cell line starts a new batch
+      correctly.
+    * Batches are taken in ``pending_cre.loc[batch_indices]`` order, and the
+      indices come from a ``set`` difference, so the processing order (though not
+      the result) varies between runs.
+    * Errors are caught per batch and only printed; the loop continues, and
+      nothing records the failure. A failed batch is simply retried on the next
+      invocation because its groups are still missing from the HDF5.
+    * ``processed_count`` counts samples *attempted*, while ``total_new_samples``
+      counts groups actually created (which can be fewer if a group already
+      existed). The two are printed together and can legitimately differ.
+    """
     # Open HDF5 (append mode)
     if os.path.exists(filepath):
         f = h5py.File(filepath, 'a')
