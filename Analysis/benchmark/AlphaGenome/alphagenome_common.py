@@ -457,6 +457,19 @@ class CheckpointManager:
     """
 
     def __init__(self, checkpoint_file='checkpoint.pkl'):
+        """Initialise the manager and immediately try to restore saved progress.
+
+        Parameters
+        ----------
+        checkpoint_file : str, optional
+            Path of the pickle holding the ``processed``/``failed`` sets. A
+            missing or corrupt file is tolerated (see :meth:`load`).
+
+        Notes
+        -----
+        Loading in the constructor means callers never have to remember to call
+        :meth:`load` after instantiation.
+        """
         self.checkpoint_file = checkpoint_file
         self.processed = set()
         self.failed = set()

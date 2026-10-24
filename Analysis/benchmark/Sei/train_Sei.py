@@ -9,6 +9,68 @@ from a pre-existing 4096bp data file via --data_path.
 Usage:
     python train_Sei.py --device cuda:0 --epochs 50 --batch_size 32
     python train_Sei.py --device cuda:1 --data_path /path/to/4096bp_data.pkl
+
+What this script does
+---------------------
+Trains the Sei baseline (Chen et al., Nature Genetics 2022) on the eScreen
+benchmark dataset with five cell-line heads, one per P0 cell line (A375, HT29,
+HepG2, K562, hPSC), and evaluates it with the per-model protocol of
+Supplementary Methods §6.1: identifier-level 7:2:1 split, sigmoid on the
+logits, then per-cell-line AUROC/AUPRC (§7.1).
+
+Scope / attribution
+-------------------
+**The manuscript does not describe a Sei baseline.** Supplementary Methods
+§6.2 documents Enformer, AlphaGenome, HyenaDNA, LegNet/Dream-CNN/Dream-RNN and
+DeepSEA/NvwaCE/Malinois; Sei is absent. Everything below -- 4,096 bp input,
+centre padding, 512-unit heads, batch 32, 500-step validation -- is therefore a
+local choice built to mirror the other baselines, *not* a protocol taken from
+the paper. The evaluation metrics and the split are the only parts that follow
+§6.1/§7.1.
+
+External model wrapped
+----------------------
+``Sei5Head`` re-implements the Sei trunk inline rather than instantiating
+``Sei.Sei_Default``, because that class is broken (undefined ``Sei`` in its
+``super()`` call -- see ``Sei.py``). Only ``BSplineTransformation`` is imported
+from the vendored module. No Sei pretrained weights are loaded: trained from
+scratch.
+
+Input geometry
+--------------
+512 bp one-hot windows are centre-padded to 4,096 bp (Sei's native width) with
+zeros, i.e. 1,792 bp of "all channels off" on each side. Zero padding is not
+the same as padding with N: the first convolution sees an all-zero column, and
+the spline basis treats it as a valid position.
+
+Expected on disk
+----------------
+* ``../_shared/data_utils.py`` -- ``build_datasets_from_original``,
+  ``per_cell_line_metrics``, ``print_metrics_table``, ``save_metrics``,
+  ``P0_CELL_LINES``, ``CELL_LINE_TO_IDX``. **This directory does not exist in
+  the current checkout**, so the script only runs where the shared helpers are
+  present; ``build_datasets_from_original`` is also what hard-codes the
+  ``randomCRE.4.pkl`` path.
+* Optional ``--data_path``: a pickle holding either a 4-tuple/list
+  ``(trainset, validset, testset, locusset)`` or a single dict (all other
+  splits are then ``None`` and skipped).
+
+Outputs (``--output_dir``, default ``./Models``)::
+
+    Models/Sei_5head[.best|.epoch<N>].pt
+    Models/Sei_5head_metrics.csv          # via save_metrics; _regression suffix
+                                          # when --regression is given
+
+Entry points
+------------
+    python train_Sei.py --device cuda:0 --epochs 50 --batch_size 32
+    python train_Sei.py --device cuda:1 --data_path /path/to/4096bp_data.pkl
+    python train_Sei.py --regression        # L1 on logistic-normalised targets
+
+The ``--regression`` branch supervises the logistic-normalised activity values
+directly (§2.3.2) with L1 loss and selects on mean -L1; it exists so that Sei
+can also serve the MPRA-style regression comparison, where §7.1 asks for
+Pearson correlation rather than AUROC.
 """
 import argparse, os, sys, gc, pickle, warnings
 warnings.filterwarnings('ignore')
@@ -36,9 +98,57 @@ from Sei import BSplineTransformation
 
 # ── Model ───────────────────────────────────────────────────────────
 class Sei5Head(nn.Module):
-    """Sei backbone with 5 separate output heads, input length 4096bp."""
+    """Sei trunk with a shared feature map and five cell-line heads.
+
+    The trunk is copied inline from ``Sei.Sei_Default`` (which cannot be
+    instantiated) and truncated: the 21,907-track classifier becomes five
+    independent ``Linear(960 * 16, 512) -> ReLU -> Dropout(0.3) -> Linear(512, 1)``
+    heads. Nothing here is specified by the manuscript -- Sei has no section in
+    Supplementary Methods §6.2.
+
+    Parameters
+    ----------
+    sequence_length : int, default 4096
+        Input width the trunk is designed for. Informational only: the
+        convolutions are length-agnostic, so a different width would work as
+        long as it stays divisible by 64 (three 4x pools).
+    num_heads : int, default 5
+        Number of cell-line heads; order must match ``P0_CELL_LINES``
+        (A375, HT29, HepG2, K562, hPSC).
+
+    Attributes
+    ----------
+    lconv1, lconv2, lconv3 : nn.Sequential
+        Pre-pooling branches whose outputs feed the residual adds and the
+        dilated stack.
+    conv1, conv2, conv3 : nn.Sequential
+        Post-branch convolutional stages with ReLU.
+    dconv1 ... dconv5 : nn.Sequential
+        Dilated residual convolutions with dilations 2, 4, 8, 16, 25.
+    spline_tr : nn.Sequential
+        Dropout(0.5) followed by :class:`Sei.BSplineTransformation`, which
+        compresses 64 positions to 16 coefficients per channel.
+    heads : nn.ModuleList
+        The five cell-line-specific classifiers.
+
+    Notes
+    -----
+    * Shape flow: ``(B, 4, 4096)`` -> 4096 -> (pool 4) 1024 -> (pool 4) 256 ->
+      (pool 4) 64 -> spline -> ``(B, 960 * 16)`` -> one logit per head.
+    * This is a duplicate of the trunk in ``train_FACS_Sei.py``; edits must be
+      mirrored in both files and in ``Sei.Sei_Default``.
+    """
 
     def __init__(self, sequence_length=4096, num_heads=5):
+        """Build the trunk layers and the five heads.
+
+        Parameters
+        ----------
+        sequence_length : int, default 4096
+            Declared input width; no layer is sized from it.
+        num_heads : int, default 5
+            Number of cell-line heads.
+        """
         super().__init__()
 
         # ── Shared Sei backbone ──
@@ -118,6 +228,25 @@ class Sei5Head(nn.Module):
         ])
 
     def forward(self, x):
+        """Return one logit per cell line for every sample.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            One-hot DNA ``(B, 4, L)`` with ``L = 4096`` (channels first).
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B, num_heads)`` raw logits; the caller selects the column for each
+            sample's cell line before any sigmoid.
+
+        Notes
+        -----
+        The dilated stack is a residual sum, so the final map keeps the 64-position
+        resolution of the last pooling stage; no global pooling is applied before
+        the spline compression.
+        """
         # x: (B, 4, L) — L=4096
         lout1 = self.lconv1(x)
         out1 = self.conv1(lout1)
@@ -148,13 +277,35 @@ class Sei5Head(nn.Module):
 
 # ── Data ────────────────────────────────────────────────────────────
 def pad_to_4096(seq_np):
-    """Center-pad (N, L, 4) OHE array to (N, 4096, 4)."""
+    """Centre-pad or centre-crop a one-hot array to exactly 4,096 bp.
+
+    Parameters
+    ----------
+    seq_np : numpy.ndarray
+        One-hot DNA ``(N, L, 4)``; base position on axis 1, A/C/G/T on axis 2.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(N, 4096, 4)``, same dtype. Shorter inputs are zero-padded
+        symmetrically, longer ones are centre-cropped.
+
+    Notes
+    -----
+    Padding with zeros is *not* padding with N: an all-zero column means "no
+    base", which the first convolution treats differently from a one-hot N. The
+    odd padding base is added on the right so the original window stays centred.
+    This helper is duplicated in ``train_FACS_Sei.py``.
+    """
     n, l, c = seq_np.shape
     if l == 4096:
         return seq_np
     if l > 4096:
         start = (l - 4096) // 2
         return seq_np[:, start:start + 4096, :]
+        # Symmetric centre padding, following the same convention §6.2.5 reports
+        # for the DeepSEA baseline (512 -> 4,096 bp). ``pad_right`` takes the odd
+        # base so that the original window stays centred.
     pad_total = 4096 - l
     pad_left = pad_total // 2
     pad_right = pad_total - pad_left
@@ -163,6 +314,18 @@ def pad_to_4096(seq_np):
 
 class SeiDataset(torch.utils.data.Dataset):
     def __init__(self, data_dict, regression=False):
+        """Materialise a split, padding every window up front.
+
+        Parameters
+        ----------
+        data_dict : dict
+            Split with ``'sequence'`` ``(N, L, 4)``, ``'label'`` ``(N,)``,
+            ``'cell_line_idx'`` ``(N,)`` and, in regression mode, ``'y'``
+            ``(N,)`` holding the logistic-normalised activity.
+        regression : bool, default False
+            When True the dataset yields ``'y'`` instead of the binarised
+            ``'label'``.
+        """
         self.seq = torch.tensor(
             pad_to_4096(data_dict['sequence']).transpose(0, 2, 1),
             dtype=torch.float
@@ -174,9 +337,18 @@ class SeiDataset(torch.utils.data.Dataset):
             self.y = torch.tensor(data_dict['y'], dtype=torch.float)
 
     def __len__(self):
+        """Number of samples in the split."""
         return len(self.labels)
 
     def __getitem__(self, idx):
+        """Return ``(sequence, target, cell_line_index)`` for one sample.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``(4, 4096)`` float, scalar float target, scalar int64 cell line.
+            The target is ``'y'`` in regression mode and ``'label'`` otherwise.
+        """
         if self.regression:
             return self.seq[idx], self.y[idx], self.cl_idx[idx]
         return self.seq[idx], self.labels[idx], self.cl_idx[idx]
@@ -185,6 +357,31 @@ class SeiDataset(torch.utils.data.Dataset):
 # ── Training ────────────────────────────────────────────────────────
 @torch.no_grad()
 def predict(model, data_dict, batch_size, device):
+    """Score a whole split with the head matching each sample's cell line.
+
+    Parameters
+    ----------
+    model : Sei5Head
+        Model in any mode; ``eval()`` is applied here.
+    data_dict : dict
+        Split with ``'sequence'`` and ``'cell_line_idx'``.
+    batch_size : int
+        Inference batch size, reused from training.
+    device : torch.device
+        Device holding the model.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``float32`` raw head outputs of shape ``(N,)`` in input order; no
+        sigmoid, no per-mode transformation.
+
+    Notes
+    -----
+    The entire padded split is materialised on the GPU before the loop: at
+    4,096 bp this is 64 KB per sample in float32, so the validation/test splits
+    fit but the training split deliberately goes through the ``DataLoader``.
+    """
     model.eval()
     all_preds = []
     seq = torch.tensor(
@@ -205,6 +402,15 @@ def predict(model, data_dict, batch_size, device):
 
 # ── Main ────────────────────────────────────────────────────────────
 def main():
+    """Parse CLI arguments, train the five-head model, evaluate and save.
+
+    Returns
+    -------
+    None
+        Metrics go to ``<output_dir>/Sei_5head_metrics.csv`` (via
+        ``save_metrics``) and to stdout; the chr11 locus table is printed when
+        that split exists.
+    """
     parser = argparse.ArgumentParser(description='Sei — 5-head model (4096bp)')
     parser.add_argument('--device', default='cuda:0', help='GPU device, e.g. cuda:0')
     parser.add_argument('--epochs', type=int, default=50)
@@ -230,6 +436,10 @@ def main():
     # 1. Data
     print('\n[1/4] Loading data...')
     if args.data_path is not None:
+        # A pre-computed 4,096 bp bundle bypasses ``build_datasets_from_original``
+        # entirely, which is the only route that works without the missing
+        # ``_shared`` helpers. Contract: a pickle holding a list/tuple whose first
+        # four entries are (train, valid, test, locus) dicts, or a single dict.
         # Load pre-processed 4096bp data
         print(f'  Loading 4096bp data from {args.data_path}')
         with open(args.data_path, 'rb') as f:
@@ -238,6 +448,9 @@ def main():
     else:
         trainset, validset, testset, locusset = build_datasets_from_original()
 
+    # ``drop_last=True`` is a convenience, not a requirement: unlike the NVWACE
+    # and eScreen trunks, Sei uses no BatchNorm (only dropout), so a batch of size
+    # 1 would not raise. It only keeps the per-step loss comparable across steps.
     train_loader = torch.utils.data.DataLoader(
         SeiDataset(trainset, regression=args.regression),
         batch_size=args.batch_size, shuffle=True, drop_last=True
@@ -253,6 +466,8 @@ def main():
     print(f'  Total params: {total_params:,}, Trainable: {trainable:,}')
 
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # ``loss_fn`` is built unconditionally but only used in classification mode;
+    # the regression branch below uses ``F.l1_loss`` on the raw head output.
     loss_fn = nn.BCEWithLogitsLoss()
 
     # 3. Train
@@ -297,6 +512,9 @@ def main():
             if valid_count >= args.check_step:
                 pv = predict(model, validset, args.batch_size, device)
 
+                # Regression mode has no AUROC: the validation score is the
+                # *negative* mean absolute error, computed per cell line and
+                # averaged, so that "higher is better" holds for both branches.
                 if args.regression:
                     # For regression: use negative L1 as validation score
                     y_val = np.asarray(validset['y'], dtype=float)
@@ -340,6 +558,9 @@ def main():
     # 4. Evaluate
     print('\n[4/4] Evaluating on test set...')
     pt = predict(model, testset, args.batch_size, device)
+    # In classification mode the metric helpers expect probabilities, hence the
+    # sigmoid (matching §6.1: AUROC computed after applying a sigmoid); in
+    # regression mode the raw prediction already lives on the [0, 1] target scale.
     pt_score = pt if args.regression else 1 / (1 + np.exp(-pt))
 
     results = per_cell_line_metrics(pt_score, testset)

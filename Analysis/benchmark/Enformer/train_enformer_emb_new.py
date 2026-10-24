@@ -8,6 +8,42 @@ Adapted from train_enformer_emb.py for the new data format:
   - Sample splits: enformer_embeddings/sample_split.npy  (0=train, 1=valid, 2=test)
   - Sample CRE IDs: enformer_embeddings/sample_cre_ids.npy
   - No locus holdout set in the new split.
+
+What this script implements
+---------------------------
+The same decoder as ``train_enformer_emb.py`` (Supplementary Methods §6.2.1,
+embedding fine-tuning with a frozen Enformer), but wired to the patch-based
+extraction of ``extraEnformerEmb.py``: it reads the split labels that script
+wrote instead of the identifier-level split stored in the exported CSV.
+
+Because the split is spatial (CREs sharing a 114,688 bp patch always share a
+split), this variant is the leakage-safe one for long-range regulatory context,
+but it is *not* the split used elsewhere in the benchmark — see the warning in
+``extraEnformerEmb.py``. Results are therefore not directly comparable with the
+other models' numbers.
+
+Expected on disk
+----------------
+Inputs::
+
+    # Hard-coded absolute path on the authors' cluster (adjust before rerunning);
+    # only the (cell_line, label) columns and the row index are needed.
+    /cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/
+        TestData_20260509.randomCRE.4.pkl
+
+    ./enformer_embeddings/embeddings.memmap        # (n_unique, 4, 3072) f32
+    ./enformer_embeddings/cre_to_emb_idx.pkl        # cre_id -> memmap row
+    ./enformer_embeddings/sample_cre_ids.npy        # CRE id per sample
+    ./enformer_embeddings/sample_split.npy          # 0=train, 1=valid, 2=test
+
+Outputs: ``./enformer_embeddings/enformer_emb_mlp_patch_split_test_results.csv``.
+No weights are saved.
+
+External dependency not vendored in this repository
+---------------------------------------------------
+``data_utils`` from ``../_shared/`` — that directory does not exist in this
+repository snapshot (``per_cell_line_metrics``, ``print_metrics_table``,
+``save_metrics``, ``P0_CELL_LINES``, ``CELL_LINE_TO_IDX``).
 """
 
 import argparse, os, sys, pickle, warnings
@@ -48,14 +84,57 @@ MIN_CELL_LINES = 2
 
 # ── Numpy compat (old pickle format) ──
 class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Unpickler that rewrites ``numpy._core`` module paths to ``numpy.core``.
+
+    Allows the pre-numpy-2.0 eScreen bundle to be loaded under numpy 2.x (or the
+    reverse) without pinning a numpy version; ``numpy.core`` remains a
+    compatibility alias.
+
+    Parameters
+    ----------
+    Inherits ``pickle.Unpickler``'s constructor (a file-like object).
+    """
+
     def find_class(self, module, name):
+        """Resolve a pickled class, normalising the numpy module prefix.
+
+        Parameters
+        ----------
+        module : str
+            Dotted module path recorded in the pickle.
+        name : str
+            Class (or function) name within that module.
+
+        Returns
+        -------
+        type or function
+            The resolved object.
+
+        Notes
+        -----
+        Only ``numpy._core`` (numpy >= 2.0) is rewritten; other modules are
+        delegated to the base implementation unchanged.
+        """
         if module.startswith('numpy._core'):
             module = 'numpy.core' + module[len('numpy._core'):]
         return super().find_class(module, name)
 
 
 def load_original_data():
-    """Load the original 8-tuple pickle."""
+    """Load the original 8-tuple pickle.
+
+    Returns
+    -------
+    tuple
+        ``(trainset, validset, testset, train_idx, valid_idx, test_idx,
+        cre_sub, final_df)`` — the first eight elements of the bundle. This script
+        uses only ``*_idx`` and ``cre_sub``.
+
+    Notes
+    -----
+    See the note in ``extraEnformerEmb.py``: the pickle was written by a
+    different numpy major version, hence :class:`_NumpyCompatUnpickler`.
+    """
     print(f'[Data] Loading original 8-tuple from {ORIGINAL_PATH}')
     with open(ORIGINAL_PATH, 'rb') as f:
         bundle = _NumpyCompatUnpickler(f).load()
@@ -67,10 +146,43 @@ def load_original_data():
 # ══════════════════════════════════════════════════════════
 
 class EnformerCellMLP(nn.Module):
-    """Enformer embedding + cell embedding → MLP → binary prediction."""
+    """Enformer embedding + cell embedding → MLP → binary prediction.
+
+    Byte-for-byte the same architecture as ``train_enformer_emb.py``'s class (the
+    two files are intentionally independent so either can be run alone). See that
+    docstring for the layer-by-layer description; the forward pass returns logits
+    of shape ``(B,)`` from a flattened ``(B, 4, 3072)`` embedding plus a
+    ``(B,)`` cell-line index.
+
+    Notes
+    -----
+    The uniform-looking attribute names (``enformer_proj``, ``cell_embedding``,
+    ``mlp``) matter: checkpoints saved from one script's model would load into
+    the other's.
+    """
 
     def __init__(self, enformer_dim=ENFORMER_DIM, cre_bins=CRE_BINS,
                  num_cell_lines=N_CELL_LINES, cell_emb_dim=CELL_EMB_DIM):
+        """Build the projection, the cell-line table and the MLP head.
+
+        Parameters
+        ----------
+        enformer_dim : int, optional
+            Width of one Enformer trunk bin (3072).
+        cre_bins : int, optional
+            Bins taken per CRE (4); the projection's input size is
+            ``enformer_dim * cre_bins``.
+        num_cell_lines : int, optional
+            Rows in the cell-line embedding table (5).
+        cell_emb_dim : int, optional
+            Width of that embedding (32).
+
+        Notes
+        -----
+        Layer shapes and names must stay identical to
+        ``train_enformer_emb.EnformerCellMLP`` so a checkpoint trained by either
+        script loads into the other.
+        """
         super().__init__()
         self.enformer_proj = nn.Sequential(
             nn.Linear(enformer_dim * cre_bins, 256),
@@ -87,6 +199,20 @@ class EnformerCellMLP(nn.Module):
         )
 
     def forward(self, enformer_emb, cell_line_idx):
+        """Compute per-sample logits.
+
+        Parameters
+        ----------
+        enformer_emb : torch.Tensor
+            ``(B, 4, 3072)`` frozen trunk embeddings.
+        cell_line_idx : torch.Tensor
+            ``(B,)`` int64 indices into the cell-line embedding table.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B,)`` logits (no sigmoid).
+        """
         B = enformer_emb.shape[0]
         emb_flat = enformer_emb.reshape(B, -1)
         emb_proj = self.enformer_proj(emb_flat)
@@ -101,15 +227,62 @@ class EnformerCellMLP(nn.Module):
 # ══════════════════════════════════════════════════════════
 
 def _relabel(cl):
+    """Map a raw cell-line label to its benchmark name (``WTC11`` -> ``hPSC``).
+
+    Parameters
+    ----------
+    cl : str
+        Raw cell-line value from the table.
+
+    Returns
+    -------
+    str
+        Canonical label, unchanged when not in :data:`P0_RELABEL`.
+    """
     cl = str(cl)
     return P0_RELABEL.get(cl, cl)
 
 
 def _cell_idx(cl):
+    """Map a raw cell-line label to its integer embedding index.
+
+    Parameters
+    ----------
+    cl : str
+        Raw cell-line value.
+
+    Returns
+    -------
+    int
+        Index in ``P0_CELL_LINES`` order (via ``CELL_LINE_TO_IDX``).
+    """
     return CELL_LINE_TO_IDX[_relabel(cl)]
 
 
 def _is_p0(idx, cre_sub, p0_set):
+    """Return True if a CRE-table row belongs to one of the five P0 cell lines.
+
+    Parameters
+    ----------
+    idx : int
+        *Label* index into ``cre_sub``.
+    cre_sub : pandas.DataFrame
+        The full CRE table from the original bundle.
+    p0_set : set of str
+        The five accepted cell-line labels.
+
+    Returns
+    -------
+    bool
+        True for a P0 cell line, and for WTC11 (relabelled to hPSC).
+
+    Notes
+    -----
+    This must reproduce ``extraEnformerEmb._is_p0`` exactly: the assertion in
+    :func:`load_data` checks only the *length* of the reconstructed sample list,
+    so a filter that differs subtly (same count, different rows) would pass and
+    silently pair embeddings with the wrong metadata.
+    """
     cl = str(cre_sub.loc[idx, 'cell_line'])
     if cl.upper() == 'WTC11':
         return 'hPSC' in P0_RELABEL.values()
@@ -117,7 +290,40 @@ def _is_p0(idx, cre_sub, p0_set):
 
 
 def load_data(device):
-    """Load data using the new patch-based split from extraEnformerEmb.py."""
+    """Load data using the new patch-based split from extraEnformerEmb.py.
+
+    Parameters
+    ----------
+    device : torch.device
+        Unused (tensors are built on CPU); kept for symmetry with the caller.
+
+    Returns
+    -------
+    dict
+        ``{'train'|'valid'|'test': {'emb', 'cl_idx', 'label', 'n'}}``. A split
+        with no samples maps to ``None``.
+
+    Notes
+    -----
+    * Two separate sources have to be reconciled: **metadata** (cell line, label,
+      interval) is rebuilt from the original pickle, while **splits and
+      embeddings** come from ``extraEnformerEmb.py``'s ``.npy``/memmap files.
+      They are stitched together positionally — ``sample_cre_ids`` and
+      ``sample_split`` are assumed to be in the same order as the reconstructed
+      P0-filtered list.
+    * The two ``assert`` statements only compare *lengths*. They would not catch a
+      reordering, which is why ``_is_p0`` must match the extraction script
+      exactly. This is the most fragile point of the script.
+    * ``p0_meta = cre_sub.loc[p0_filtered]`` keeps the original index, so
+      ``p0_meta[mask]`` (boolean array from ``sample_split``) relies on the index
+      being ordered like ``p0_filtered`` — true because ``.loc`` preserves order.
+    * ``cre_to_emb.get(cid, 0)`` silently falls back to embedding row 0 for an
+      unknown CRE id: a missing id corrupts that sample's features instead of
+      raising. (The ``0`` row is a real CRE, so this is a quiet data bug, not an
+      obvious blank.)
+    * ``sample_split`` is matched against the integer codes 0/1/2 written by the
+      extraction script; ``split_map`` mirrors ``SPLIT_LABELS`` there.
+    """
     # ── 1. Load original cre_sub for cell_line/label mapping ──
     _, _, _, train_idx, valid_idx, test_idx, cre_sub, _ = load_original_data()
     pool_index = list(train_idx) + list(valid_idx) + list(test_idx)
@@ -207,6 +413,31 @@ def load_data(device):
 # ══════════════════════════════════════════════════════════
 
 def train_epoch(model, data, optimizer, device):
+    """Run one full pass over the training split.
+
+    Parameters
+    ----------
+    model : EnformerCellMLP
+        Model, set to train mode here.
+    data : dict
+        The ``'train'`` entry from :func:`load_data`.
+    optimizer : torch.optim.Optimizer
+        AdamW built in :func:`run`.
+    device : torch.device
+        Target device.
+
+    Returns
+    -------
+    float
+        Mean batch loss over the epoch (batches weighted equally, not by size).
+
+    Notes
+    -----
+    Identical to the ``train_enformer_emb.py`` version except for
+    ``non_blocking=True`` on the host-to-device copies; that only pays off with
+    pinned memory, which these tensors do not use, so it is effectively a no-op
+    here.
+    """
     model.train()
     emb = data['emb'].to(device, non_blocking=True)
     cl_idx = data['cl_idx'].to(device, non_blocking=True)
@@ -233,6 +464,34 @@ def train_epoch(model, data, optimizer, device):
 
 @torch.no_grad()
 def evaluate(model, data, device):
+    """Evaluate the model on one split.
+
+    Parameters
+    ----------
+    model : EnformerCellMLP
+        Model to evaluate.
+    data : dict
+        One split from :func:`load_data`; must not be ``None``.
+    device : torch.device
+        Device to evaluate on.
+
+    Returns
+    -------
+    loss : float
+        BCE-with-logits reduced over all rows.
+    probs : numpy.ndarray
+        ``(n,)`` sigmoid probabilities.
+    labels : numpy.ndarray
+        ``(n,)`` ground-truth labels.
+    cl_idx : numpy.ndarray
+        ``(n,)`` cell-line indices, mapped back through ``P0_CELL_LINES`` by the
+        caller.
+
+    Notes
+    -----
+    Same reduction and batch size as the original script, so the two variants'
+    validation losses are comparable.
+    """
     model.eval()
     emb = data['emb'].to(device, non_blocking=True)
     cl_idx = data['cl_idx'].to(device, non_blocking=True)
@@ -256,6 +515,24 @@ def evaluate(model, data, device):
 
 
 def run():
+    """Parse CLI arguments, train, and report test metrics for the patch split.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    * Identical optimisation setup to ``train_enformer_emb.py`` (AdamW 1e-3,
+      weight decay 1e-5, batch 256, ReduceLROnPlateau on max validation AUROC,
+      early stop 10) so that any difference in the reported numbers is
+      attributable to the split, not to the training recipe.
+    * There is no locus split in the patch-based scheme, hence no locus block
+      here; ``extraEnformerEmb.py`` assigns those CREs to train/valid/test like
+      any other.
+    * ``np.isnan`` filtering of per-cell-line AUROCs is required for the same
+      reason as in the original script.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--epochs', type=int, default=50)

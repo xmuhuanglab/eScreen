@@ -107,6 +107,25 @@ class _NumpyCompatUnpickler(pickle.Unpickler):
     """
 
     def find_class(self, module, name):
+        """Resolve a pickled class, normalising the numpy module prefix.
+
+        Parameters
+        ----------
+        module : str
+            Dotted module path recorded in the pickle.
+        name : str
+            Class (or function) name within that module.
+
+        Returns
+        -------
+        type or function
+            The resolved object.
+
+        Notes
+        -----
+        Only ``numpy._core`` (numpy >= 2.0) is rewritten; every other module is
+        delegated to the base implementation unchanged.
+        """
         if module.startswith('numpy._core'):
             module = 'numpy.core' + module[len('numpy._core'):]
         return super().find_class(module, name)

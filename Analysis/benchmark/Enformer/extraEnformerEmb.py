@@ -155,6 +155,25 @@ class _NumpyCompatUnpickler(pickle.Unpickler):
     """
 
     def find_class(self, module, name):
+        """Resolve a pickled class, normalising the numpy module prefix.
+
+        Parameters
+        ----------
+        module : str
+            Dotted module path recorded in the pickle.
+        name : str
+            Class (or function) name within that module.
+
+        Returns
+        -------
+        type or function
+            The resolved object.
+
+        Notes
+        -----
+        Only ``numpy._core`` (numpy >= 2.0) is rewritten; every other module is
+        delegated to the base implementation unchanged.
+        """
         if module.startswith('numpy._core'):
             module = 'numpy.core' + module[len('numpy._core'):]
         return super().find_class(module, name)
@@ -253,6 +272,26 @@ def get_unique_cre_data():
 
     # 3. P0 filter
     def _is_p0(idx):
+        """Return True if a CRE-table row belongs to one of the five P0 cell lines.
+
+        Parameters
+        ----------
+        idx : int
+            *Label* index into ``cre_sub`` (a value taken from ``pool_index``).
+
+        Returns
+        -------
+        bool
+            True for A375 / HT29 / HepG2 / K562 / hPSC, and for WTC11, which the
+            benchmark relabels as hPSC.
+
+        Notes
+        -----
+        The WTC11 branch tests ``'hPSC' in P0_RELABEL.values()`` — a constant
+        True — rather than hard-coding ``True``, so that removing the relabel
+        entry would also disable the WTC11 inclusion. ``str()`` guards against
+        NaN cell-line values.
+        """
         cl = str(cre_sub.loc[idx, 'cell_line'])
         if cl.upper() == 'WTC11':
             return 'hPSC' in P0_RELABEL.values()
@@ -451,6 +490,26 @@ def one_hot_encode_dna(sequence, dtype=np.float32):
     neutral = 'N'
 
     def _to_uint8(s):
+        """View a string's ASCII bytes as a ``uint8`` array (no copy of characters).
+
+        Parameters
+        ----------
+        s : str
+            ASCII string, here either the alphabet or a full DNA sequence.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``uint8`` array of the same length, one byte per character — usable
+            directly as a fancy-index into the lookup table.
+
+        Notes
+        -----
+        ``np.frombuffer`` on ``s.encode('ascii')`` is the fast path: it avoids
+        Python-level iteration over ~393 k characters per sequence. Encoding as
+        ASCII (rather than UTF-8) guarantees one byte per character, which is what
+        makes the byte values usable as table indices.
+        """
         return np.frombuffer(s.encode('ascii'), dtype=np.uint8)
 
     table = np.zeros((np.iinfo(np.uint8).max, len(alphabet)), dtype=dtype)
@@ -607,6 +666,28 @@ def worker(gpu_id, cre_info_path, memmap_path, n_total):
     captured_inputs = list(concrete._captured_inputs)
 
     def get_embedding(seq_input):
+        """Run the pruned Enformer trunk on one batch of sequences.
+
+        Parameters
+        ----------
+        seq_input : numpy.ndarray or torch.Tensor
+            One-hot DNA of shape ``(B, 393216, 4)``.
+
+        Returns
+        -------
+        tensor
+            Trunk activations of shape ``(B, 896, 3072)`` — 896 bins of 128 bp,
+            3072 channels, i.e. the layer before Enformer's output heads.
+
+        Notes
+        -----
+        The pruned concrete function expects the sequence followed by the
+        original concrete function's captured inputs, hence
+        ``embedding_fn(seq_input, *captured_inputs)``. The
+        ``isinstance(result, (list, tuple))`` guard handles both a single-tensor
+        and a multi-output fetch; only the first (and only) fetch is configured, so
+        either way one tensor comes back.
+        """
         seq_input = tf.convert_to_tensor(seq_input, dtype=tf.float32)
         result = embedding_fn(seq_input, *captured_inputs)
         return result[0] if isinstance(result, (list, tuple)) else result

@@ -130,6 +130,25 @@ class EnformerCellMLP(nn.Module):
 
     def __init__(self, enformer_dim=ENFORMER_DIM, cre_bins=CRE_BINS,
                  num_cell_lines=N_CELL_LINES, cell_emb_dim=CELL_EMB_DIM):
+        """Build the projection, the cell-line table and the MLP head.
+
+        Parameters
+        ----------
+        enformer_dim : int, optional
+            Width of one Enformer trunk bin (3072).
+        cre_bins : int, optional
+            Bins taken per CRE (4); the projection's input size is
+            ``enformer_dim * cre_bins``.
+        num_cell_lines : int, optional
+            Rows in the cell-line embedding table (5).
+        cell_emb_dim : int, optional
+            Width of that embedding (32).
+
+        Notes
+        -----
+        ``ReLU(inplace=True)`` is safe here because no tensor is reused after the
+        activation, and it saves a temporary per layer.
+        """
         super().__init__()
         self.enformer_proj = nn.Sequential(
             nn.Linear(enformer_dim * cre_bins, 256),

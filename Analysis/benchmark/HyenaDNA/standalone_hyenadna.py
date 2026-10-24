@@ -62,6 +62,22 @@ def fftconv(u, k, D):
 
 @torch.jit.script
 def mul_sum(q, y):
+    """Element-wise product summed over the head axis.
+
+    The Hyena recurrence combines two multiplicative gates; summing over
+    ``dim=1`` collapses the per-head dimension so the result matches the
+    value-branch width.
+
+    Parameters
+    ----------
+    q, y : torch.Tensor
+        Gate tensors of shape ``[B, heads, L]``.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(q * y).sum(dim=1)``, shape ``[B, L]``.
+    """
     return (q * y).sum(dim=1)
 
 class OptimModule(nn.Module):
@@ -84,14 +100,44 @@ class OptimModule(nn.Module):
 class Sin(nn.Module):
     """The Sin activation function for the Hyena Filter function."""
     def __init__(self, dim, w=10, train_freq=True):
+        """Set up the sinusoidal frequency bank.
+
+        Parameters
+        ----------
+        dim : int
+            Embedding width; half the channels carry ``sin`` and half ``cos``.
+        w : float, default 10
+            Base frequency; the bank is geometrically spaced in ``w``.
+        train_freq : bool, default True
+            Whether the frequency bank is a learnable parameter.
+        """
         super().__init__()
         self.freq = nn.Parameter(w * torch.ones(1, dim)) if train_freq else w * torch.ones(1, dim)
 
     def forward(self, x):
+        """Evaluate ``sin(freq * x)`` element-wise.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Positions, broadcast against the frequency bank.
+
+        Returns
+        -------
+        torch.Tensor
+            ``[..., dim]`` sinusoidal encoding.
+        """
         return torch.sin(self.freq * x)
 
 
 class PositionalEmbedding(OptimModule):
+    """Positional and decay embeddings for the implicit long filter.
+
+    Provides the two tensors the filter needs: ``t``, the window position used
+    to drive the exponential decay, and ``z``, the positional embedding fed to
+    the filter MLP.  The embedding length is truncated to the requested ``L``,
+    so the same table serves every sequence length up to the maximum.
+    """
     def __init__(self, emb_dim: int, seq_len: int, lr_pos_emb: float=1e-5, **kwargs):
         """Complex exponential positional embeddings for Hyena filters."""
         super().__init__()
@@ -113,6 +159,20 @@ class PositionalEmbedding(OptimModule):
         self.register("t", t, lr=0.0)
 
     def forward(self, L):
+        """Slice the embedding to the requested length.
+
+        Parameters
+        ----------
+        L : int
+            Sequence length.
+
+        Returns
+        -------
+        z : torch.Tensor
+            Positional embedding, ``[dim, L]``.
+        t : torch.Tensor
+            Window position driving the exponential decay, ``[dim, L]``.
+        """
         return self.z[:, :L], self.t[:, :L]
 
 
@@ -129,6 +189,19 @@ class ExponentialModulation(OptimModule):
         shift: float = 0.05,
         **kwargs
     ):
+        """Set up the exponential decay.
+
+        Parameters
+        ----------
+        dim : int
+            Feature width.
+        fast_decay_pct, slow_decay_pct : float
+            Fraction of channels assigned the fast or slow initial decay.
+        decay_min, decay_max : float
+            Range from which the remaining channels' decay rates are sampled.
+        modulate : bool, default True
+            Whether to apply the decay at all.
+        """
         super().__init__()
         self.modulate = modulate
         self.shift = shift
@@ -138,6 +211,23 @@ class ExponentialModulation(OptimModule):
         self.register("deltas", deltas, lr=modulation_lr)
 
     def forward(self, t, x):
+        """Apply ``exp(-t * |k|)`` decay to the raw filter.
+
+        The decay is what bounds the effective kernel length: without it the
+        implicit filter would be periodic in position rather than decaying.
+
+        Parameters
+        ----------
+        t : torch.Tensor
+            Window positions, ``[dim, L]``.
+        x : torch.Tensor
+            Raw filter output of the MLP, ``[dim, L]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Decayed filter, same shape.
+        """
         if self.modulate:
             decay = torch.exp(-t * self.deltas.abs())
             x = x * (decay + self.shift)
@@ -145,6 +235,16 @@ class ExponentialModulation(OptimModule):
 
 
 class HyenaFilter(OptimModule):
+    """Implicit long-convolution filter used by :class:`HyenaOperator`.
+
+    The kernel is not materialised as ``L`` learned weights.  Instead a
+    positional embedding is passed through a small MLP and multiplied by an
+    exponential decay, so the effective kernel length is controlled by a few
+    learned poles plus a length parameter.  This is the 'implicit' part of
+    Hyena referred to in Supplementary Methods section 2.1: a single layer
+    reaches the whole sequence, which is why the eScreen backbone does not need
+    a deep convolutional stack to build a receptive field.
+    """
     def __init__(
             self,
             d_model,
@@ -208,12 +308,42 @@ class HyenaFilter(OptimModule):
                 setattr(getattr(c, name), "_optim", optim)
 
     def filter(self, L, *args, **kwargs):
+        """Generate the convolution filter of length ``L``.
+
+        Parameters
+        ----------
+        L : int
+            Sequence length to generate.
+
+        Returns
+        -------
+        torch.Tensor
+            Filter of shape ``[order * d_model, 1, L]``, ready for :func:`fftconv`.
+        """
         z, t = self.pos_emb(L)
         h = self.implicit_filter(z)
         h = self.modulation(t, h)
         return h
 
     def forward(self, x, L, k=None, bias=None, *args, **kwargs):
+        """Generate the filter and apply it to ``x``.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input, ``[B, dim, L]``.
+        L : int
+            Sequence length.
+        k : torch.Tensor, optional
+            Pre-computed filter, so callers inside a loop need not regenerate it.
+        bias : torch.Tensor, optional
+            Optional additive filter bias.
+
+        Returns
+        -------
+        torch.Tensor
+            Filtered output, same shape as ``x``.
+        """
         if k is None: k = self.filter(L)
         #print('fft_x:',x.sum(axis=2)[:,:6])
         ## The problem is in this FFT convolution step: the x fed in here is still different
@@ -226,6 +356,13 @@ class HyenaFilter(OptimModule):
 
 
 class HyenaOperator(nn.Module):
+    """Hyena operator: gated long convolutions with element-wise multiplicative gates.
+
+    Projects the input to ``order`` gates plus a value branch, applies the
+    implicit filter of :class:`HyenaFilter` once per gate, and combines the
+    results multiplicatively.  This is the mixer that gives the encoder its
+    global receptive field in a single layer.
+    """
     def __init__(
             self,
             d_model,
@@ -273,6 +410,29 @@ class HyenaOperator(nn.Module):
         )
 
     def forward(self, u, *args, **kwargs):
+        """Apply the gated long convolutions (bidirectional in this fork).
+
+        ``u`` is projected and split into ``order`` gate tensors plus a value
+        branch ``v``.  The value branch is convolved ``order - 1`` times, gated at
+        each step by the next tensor from ``x``.
+
+        Local modification: the recurrence is then run a second time on the
+        time-flipped input, and the two results are averaged as
+        ``(v_f + v_r) * x[0] * 0.5``.  That makes the operator symmetric in
+        position instead of causal.  Upstream HyenaDNA runs the forward pass only,
+        so this fork performs roughly twice the convolution work and does not
+        reproduce the published causal model exactly.
+
+        Parameters
+        ----------
+        u : torch.Tensor
+            Input, ``[B, L, d_model]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Output, ``[B, L, d_model]``.
+        """
         l = u.size(-2)
         l_filter = min(l, self.l_max)
         u = self.in_proj(u)
@@ -345,6 +505,17 @@ class SelfAttention(nn.Module):
                            (default: 0.0)
     """
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+        """Configure the attention mixer.
+
+        Parameters
+        ----------
+        causal : bool, default False
+            Whether to apply a lower-triangular mask.
+        softmax_scale : float, optional
+            Override for the default ``1 / sqrt(head_dim)`` scaling.
+        attention_dropout : float, default 0.0
+            Dropout applied to the attention weights.
+        """
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
@@ -465,6 +636,12 @@ The MLP layer after the mixer layer (HyenaOperator).
 
 class Mlp(nn.Module):
 
+    """Gated feed-forward block.
+
+    ``fc1`` and ``fc3`` produce the two halves of a multiplicative gate and
+    ``fc2`` projects back to the model width.  Kept separate from the mixer so
+    that :class:`Block` can wrap both in pre-norm residuals.
+    """
     def __init__(self, in_features, hidden_features=None, out_features=None, activation=F.gelu,
                  return_residual=False, device=None, dtype=None):
         """
@@ -480,6 +657,18 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features, **factory_kwargs)
 
     def forward(self, x):
+        """Apply the gated feed-forward.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input, ``[..., d_model]``.
+
+        Returns
+        -------
+        torch.Tensor
+            ``fc2(fc1(x) * act(fc3(x)))``, same shape as the input.
+        """
         y = self.fc1(x)
         y = self.activation(y)
         y = self.fc2(y)
@@ -497,10 +686,24 @@ class LinearResidual(nn.Linear):
     """
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Run the wrapped module and pair its output with the residual.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``(module_output, input)``, so :class:`Block` can decide where the
+            residual addition happens relative to the following normalisation.
+        """
         return super().forward(input), input
 
 class Block(nn.Module):
 
+    """Pre-norm residual block: mixer followed by the gated MLP.
+
+    Applies ``x = mixer(norm(x)) + x`` and then ``x = mlp(norm(x)) + x``.  The
+    optional residual-in-residual scaling keeps the residual stream's variance
+    bounded as depth grows.
+    """
     def __init__(self, dim, mixer_cls=None, mlp_cls=None, norm_cls=nn.LayerNorm,
                  dropout_cls=nn.Dropout, prenorm=True, resid_dropout1=0., resid_dropout2=0.,
                  drop_path1=0., drop_path2=0.,
@@ -603,6 +806,28 @@ class Block(nn.Module):
 def create_mixer_cls(layer=None,
                      attn_layer_idx=None, attn_cfg=None, layer_idx=None,
                      device=None, dtype=None):
+    """Return the mixer class to use for a given layer.
+
+    Chooses between a Hyena variant and self-attention according to ``layer``
+    and ``attn_layer_idx``, and binds the configuration into the returned class
+    so that :func:`create_block` can instantiate every layer uniformly.
+
+    Parameters
+    ----------
+    layer : {'hyena', 'attention', 'hyena_short', 'hyena_se', 'hyena_mr', 'hyena_li', None}
+        Mixer family.
+    attn_layer_idx : list of int, optional
+        Layer indices that should use attention regardless of ``layer``.
+    attn_cfg : dict, optional
+        Arguments forwarded to the attention mixer.
+    layer_idx : int, optional
+        Index of the layer being built.
+
+    Returns
+    -------
+    type
+        A mixer class, ready to be instantiated with the bound arguments.
+    """
     factory_kwargs = {'device': device, 'dtype': dtype}
     if attn_layer_idx is not None and layer_idx in attn_layer_idx:
         
@@ -624,6 +849,22 @@ def create_mixer_cls(layer=None,
     return mixer_cls
 
 def create_mlp_cls(d_model, d_inner=None, device=None, dtype=None):
+    """Return the gated-MLP class with the requested widths.
+
+    Parameters
+    ----------
+    d_model : int
+        Input and output width.
+    d_inner : int, optional
+        Hidden width; defaults to ``4 * d_model``.
+    device, dtype : optional
+        Passed through to the constructed module.
+
+    Returns
+    -------
+    type
+        The MLP class.
+    """
     factory_kwargs = {'device': device, 'dtype': dtype}
     inner_dim = d_inner if d_inner is not None else 4 * d_model
 
@@ -639,6 +880,24 @@ def create_block(d_model, d_inner=None,
                  resid_dropout1=0.0, resid_dropout2=0.0, residual_in_fp32=False,
                  layer_idx=None,
                  device=None, dtype=None):
+    """Build one :class:`Block` containing a mixer and a gated MLP.
+
+    Parameters
+    ----------
+    d_model, d_inner : int
+        Model width and MLP inner width.
+    layer, attn_layer_idx, attn_cfg : optional
+        Mixer selection, forwarded to :func:`create_mixer_cls`.
+    layer_idx, n_layer : int
+        Position and total depth, used for residual scaling.
+    prenorm : bool
+        Whether to wrap sub-layers in pre-norm residuals.
+
+    Returns
+    -------
+    Block
+        The assembled block.
+    """
     factory_kwargs = {'device': device, 'dtype': dtype}
     mixer_cls = create_mixer_cls(layer=layer,
                                  attn_layer_idx=attn_layer_idx,
@@ -656,6 +915,26 @@ def create_block(d_model, d_inner=None,
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
 def _init_weights(module, n_layer, initializer_range=0.02, rescale_prenorm_residual=True,
                   glu_act=False):
+    """Initialise weights, including pre-norm residual rescaling.
+
+    Residual output projections are zero-initialised and then rescaled by
+    ``1 / sqrt(2 * n_layer)`` so that the variance of the residual stream does
+    not grow with depth.  This is the GPT-2 style trick and the reason a deep
+    pre-norm stack trains without learning-rate warm-up.
+
+    Parameters
+    ----------
+    module : nn.Module
+        Module to initialise, applied in place.
+    n_layer : int
+        Total depth, used for the rescaling factor.
+    initializer_range : float, default 0.02
+        Standard deviation of the normal initialisation.
+    rescale_prenorm_residual : bool, default True
+        Whether to apply the depth rescaling.
+    glu_act : bool, default False
+        Whether the MLP uses a GLU activation (affects which projections exist).
+    """
     if isinstance(module, nn.Linear):
         nn.init.normal_(module.weight, std=initializer_range)
         if module.bias is not None:
@@ -695,6 +974,13 @@ revert to doing nothing.
 
 class GPT2Embeddings(nn.Module):
 
+    """Token embedding plus an optional positional embedding table.
+
+    For HyenaDNA the vocabulary is tiny (six DNA tokens) and the positional
+    embedding can be disabled: a single Hyena layer already encodes global
+    position through its long convolution, so an explicit position table is
+    often redundant.
+    """
     def __init__(self, embed_dim, vocab_size, max_position_embeddings, padding_idx=None,
                  word_embed_proj_dim=None, device=None, dtype=None):
         """
@@ -736,12 +1022,32 @@ class GPT2Embeddings(nn.Module):
 
 class LMBackbone(nn.Module):
 
+    """Embedding stack followed by the stack of :class:`Block` layers.
+
+    This is the part of the model that produces the per-token hidden states.
+    For the distillation teacher of Supplementary Methods section 2.2 these
+    states are the 256-dimensional targets the eScreen backbone is trained to
+    reproduce.
+    """
     def __init__(self, d_model: int, n_layer: int, d_inner: int, vocab_size: int,
                  process_group=None, layer=None,
                  attn_layer_idx=None, attn_cfg=None, max_position_embeddings=0,
                  resid_dropout: float = 0.0, embed_dropout: float = 0.1,
                  layer_norm_epsilon: float = 1e-5, initializer_cfg=None,residual_in_fp32=False,
                  device=None, dtype=None, **kwargs) -> None:
+        """Build the embedding stack and the block layers.
+
+        Parameters
+        ----------
+        d_model, n_layer, d_inner : int
+            Model width, number of blocks, and MLP inner width.
+        vocab_size : int
+            Token vocabulary size (6 for DNA: A, C, G, T, N and padding).
+        prenorm : bool
+            Whether blocks use pre-norm residual wrapping.
+        max_position_embeddings : int
+            Length of the positional embedding table; 0 disables it.
+        """
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         self.process_group = process_group
@@ -766,6 +1072,20 @@ class LMBackbone(nn.Module):
                            **(initializer_cfg if initializer_cfg is not None else {})))
 
     def forward(self, input_ids, position_ids=None):
+        """Run the embeddings followed by every block.
+
+        Parameters
+        ----------
+        input_ids : torch.Tensor
+            Token ids, ``[B, L]``.
+        position_ids : torch.Tensor, optional
+            Explicit positions; ignored when positional embeddings are disabled.
+
+        Returns
+        -------
+        torch.Tensor
+            Hidden states, ``[B, L, d_model]``.
+        """
         hidden_states = self.embeddings(input_ids, position_ids=position_ids,)
         #print('hidden embedding:',hidden_states.sum(axis=2)) ## at this step the encoding indeed depends only on the character at each position
         residual = None
@@ -797,9 +1117,31 @@ states of the backbone as embeddings.
 
 
 class SequenceDecoder(nn.Module):
+    """Output head turning backbone hidden states into per-token predictions.
+
+    Supports several pooling modes over the sequence axis: ``'last'`` keeps the
+    final position, ``'first'`` the first, ``'pool'`` a trailing moving average,
+    ``'sum'`` cumulative sums, and ``'ragged'`` per-sample true lengths.  Also
+    provides :meth:`step` for single-token incremental inference.
+    """
     def __init__(
         self, d_model, d_output=None, l_output=None, use_lengths=False, mode="last"
     ):
+        """Configure the output head.
+
+        Parameters
+        ----------
+        d_model : int
+            Input width.
+        d_output : int, optional
+            Output width; defaults to ``d_model``.
+        l_output : int, optional
+            Output length for the fixed-length modes.
+        use_lengths : bool
+            Whether per-sample true lengths are supplied.
+        mode : {'last', 'first', 'pool', 'sum', 'ragged'}
+            Pooling strategy over the sequence axis.
+        """
         super().__init__()
 
         self.output_transform = nn.Identity() if d_output is None else nn.Linear(d_model, d_output)
@@ -852,6 +1194,26 @@ class SequenceDecoder(nn.Module):
             )[..., -l_output:, :]
 
             def restrict(x):
+                """Trailing moving average over the last ``l_output`` positions.
+
+                Note this ``def`` shadows the ``restrict`` lambda assigned a few lines
+                above in the same ``mode == 'pool'`` branch, so that lambda is dead code.
+
+                ``s`` holds the sum over the whole length axis; the cumulative sum of all
+                positions before the trailing window is subtracted, leaving the sums of the
+                successively shorter trailing windows, each divided by its own window length
+                so the result is a set of means rather than sums.
+
+                Parameters
+                ----------
+                x : torch.Tensor
+                    Hidden states, ``[..., L, D]``.
+
+                Returns
+                -------
+                torch.Tensor
+                    ``[..., l_output, D]`` pooled representation.
+                """
                 L = x.size(-2)
                 s = x.sum(dim=-2, keepdim=True)
                 if l_output > 1:
@@ -900,6 +1262,25 @@ class SequenceDecoder(nn.Module):
 
     def step(self, x, state=None):
         # Ignore all length logic
+        """Single-token incremental forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            One token's hidden state.
+        state : optional
+            Cache carried between calls; unused here.
+
+        Returns
+        -------
+        torch.Tensor
+            Output for this step.
+
+        Notes
+        -----
+        Length logic is intentionally skipped: the caller is expected to feed one
+        position at a time.
+        """
         return self.output_transform(x)
 
 #@title Model (backbone + head)
@@ -917,12 +1298,33 @@ feasible on colab.
 
 class HyenaDNAModel(nn.Module):
 
+    """Full HyenaDNA sequence model.
+
+    Combines the embedding stack, the Hyena blocks and the decoder behind the
+    HuggingFace-style interface that the benchmark harness drives
+    (Supplementary Methods section 6.2.3).  The specific checkpoint distilled
+    into eScreen is HyenaDNA-tiny-1k-d256 (section 2.2): 1,026 nt of context and
+    256-dimensional per-token representations.
+    """
     def __init__(self, d_model: int, n_layer: int, d_inner: int, vocab_size: int,
                  layer=None, attn_layer_idx=None, attn_cfg=None, max_position_embeddings=0,
                  resid_dropout: float = 0.0, embed_dropout: float = 0.1,
                  layer_norm_epsilon: float = 1e-5, initializer_cfg=None,residual_in_fp32=False,
                  pad_vocab_size_multiple: int = 1, use_head=False, n_classes: int = 2,
                  device=None, dtype=None, **kwargs) -> None:
+        """Assemble the backbone and the decoder.
+
+        Parameters
+        ----------
+        d_model, n_layer, d_inner : int
+            Model width, block count and MLP inner width.
+        vocab_size : int
+            DNA vocabulary size.
+        layer, attn_layer_idx, attn_cfg : optional
+            Mixer selection, forwarded to :func:`create_mixer_cls`.
+        max_position_embeddings : int
+            Length of the positional embedding table; 0 disables it.
+        """
         factory_kwargs = {'device': device, 'dtype': dtype}
         super().__init__()
         if vocab_size % pad_vocab_size_multiple != 0:
@@ -960,6 +1362,22 @@ class HyenaDNAModel(nn.Module):
     #     self.head.weight = self.backbone.embeddings.word_embeddings.weight
 
     def forward(self, input_ids, position_ids=None, state=None): # state for the repo interface
+        """Forward pass.
+
+        Parameters
+        ----------
+        input_ids : torch.Tensor
+            Token ids, ``[B, L]``.
+        position_ids : torch.Tensor, optional
+            Explicit positions; ignored when positional embeddings are disabled.
+        state : optional
+            Cache from a previous step, for incremental inference.
+
+        Returns
+        -------
+        torch.Tensor
+            Logits, ``[B, L, vocab_size]``.
+        """
         hidden_states = self.backbone(input_ids, position_ids=position_ids)
 
         if self.use_head:
@@ -986,6 +1404,13 @@ This is heavily inspired from CanineTokenizer in transformers package.
 
 
 class CharacterTokenizer(PreTrainedTokenizer):
+    """Character-level tokenizer for DNA.
+
+    Each nucleotide is its own token, so a 512 bp window becomes a 512-token
+    sequence.  Subclasses the HuggingFace ``PreTrainedTokenizer`` so the
+    tokenizer can be saved and reloaded through the usual ``from_pretrained``
+    path alongside the model weights.
+    """
     def __init__(self, characters: Sequence[str], model_max_length: int, padding_side: str='left', **kwargs):
         """Character tokenizer for Hugging Face transformers.
         Args:
@@ -1042,23 +1467,35 @@ class CharacterTokenizer(PreTrainedTokenizer):
 
     @property
     def vocab_size(self) -> int:
+        """Number of vocabulary entries, including the special tokens.
+        """
         return len(self._vocab_str_to_int)
 
     def _tokenize(self, text: str) -> List[str]:
+        """Split a DNA string into single-character tokens.
+        """
         return list(text)
 
     def _convert_token_to_id(self, token: str) -> int:
+        """Map a nucleotide character to its id, falling back to ``[UNK]``.
+        """
         return self._vocab_str_to_int.get(token, self._vocab_str_to_int["[UNK]"])
 
     def _convert_id_to_token(self, index: int) -> str:
+        """Map a token id back to its character.
+        """
         return self._vocab_int_to_str[index]
 
     def convert_tokens_to_string(self, tokens):
+        """Join tokens back into the original string.
+        """
         return "".join(tokens)
 
     def build_inputs_with_special_tokens(
         self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None
     ) -> List[int]:
+        """Return the ids unchanged: DNA sequences take no special tokens.
+        """
         sep = [self.sep_token_id]
         cls = [self.cls_token_id]
         result = cls + token_ids_0 + sep
@@ -1072,6 +1509,8 @@ class CharacterTokenizer(PreTrainedTokenizer):
         token_ids_1: Optional[List[int]] = None,
         already_has_special_tokens: bool = False,
     ) -> List[int]:
+        """Return an all-zero mask, marking every position as a real nucleotide.
+        """
         if already_has_special_tokens:
             return super().get_special_tokens_mask(
                 token_ids_0=token_ids_0,
@@ -1087,6 +1526,8 @@ class CharacterTokenizer(PreTrainedTokenizer):
     def create_token_type_ids_from_sequences(
         self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None
     ) -> List[int]:
+        """Return an all-zero segment-id vector: DNA has a single segment.
+        """
         sep = [self.sep_token_id]
         cls = [self.cls_token_id]
 
@@ -1096,6 +1537,8 @@ class CharacterTokenizer(PreTrainedTokenizer):
         return result
 
     def get_config(self) -> Dict:
+        """Return the settings needed to rebuild this tokenizer.
+        """
         return {
             "char_ords": [ord(ch) for ch in self.characters],
             "model_max_length": self.model_max_length,
@@ -1103,12 +1546,16 @@ class CharacterTokenizer(PreTrainedTokenizer):
 
     @classmethod
     def from_config(cls, config: Dict) -> "CharacterTokenizer":
+        """Rebuild a tokenizer from :meth:`get_config` output.
+        """
         cfg = {}
         cfg["characters"] = [chr(i) for i in config["char_ords"]]
         cfg["model_max_length"] = config["model_max_length"]
         return cls(**cfg)
 
     def save_pretrained(self, save_directory: Union[str, os.PathLike], **kwargs):
+        """Write ``tokenizer_config.json`` into ``save_directory``.
+        """
         cfg_file = Path(save_directory) / "tokenizer_config.json"
         cfg = self.get_config()
         with open(cfg_file, "w") as f:
@@ -1116,6 +1563,8 @@ class CharacterTokenizer(PreTrainedTokenizer):
 
     @classmethod
     def from_pretrained(cls, save_directory: Union[str, os.PathLike], **kwargs):
+        """Load a tokenizer previously written by :meth:`save_pretrained`.
+        """
         cfg_file = Path(save_directory) / "tokenizer_config.json"
         with open(cfg_file) as f:
             cfg = json.load(f)

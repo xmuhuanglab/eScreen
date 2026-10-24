@@ -2,6 +2,52 @@
 """
 Sei FACS training — single cell line, single output head, 4096bp input.
 Sei backbone (BSplineConv1D + dilated convs) + single head.
+
+FACS readout-specific evaluation of the Sei baseline, i.e. the Sei analogue of
+Supplementary Methods §5.5. One model is trained per FACS cell line (``K562``
+or ``hPSC``) on clinical-trial-style held-out splits, with 512 bp one-hot CRE
+windows centre-padded to Sei's native 4,096 bp width.
+
+Attribution caveat
+------------------
+The manuscript never describes a Sei baseline: §6.2 covers Enformer,
+AlphaGenome, HyenaDNA, LegNet/Dream and DeepSEA/NvwaCE/Malinois only. The model
+definition, padding width, head width and hyper-parameters here are local
+choices made to mirror the other FACS scripts; the evaluation protocol
+(tRRA-thresholded labels, per-cell-line AUROC/AUPRC) follows §5.5 and §7.1.
+
+Model wrapped
+-------------
+``Sei1Head``, an inline copy of the Sei trunk from ``Sei.Sei_Default`` (that
+class cannot be instantiated -- see ``Sei.py``) plus one head. Only
+``BSplineTransformation`` is imported from the vendored module. Trained from
+scratch; no Sei pretrained weights exist in this repository.
+
+Expected on disk
+----------------
+* ``../_shared/load_facs_data.py`` -- ``load_facs_for_cell_line``.
+  **Missing from this checkout**, so the script does not run as shipped. It
+  returns ``(trainset, validset, testset)`` dicts with ``'sequence'``
+  ``(N, 512, 4)``, ``'label'`` ``(N,)`` and ``'length'``; labels follow §5.5
+  (positive when tRRA > 2).
+
+Outputs (``--output_dir``, default ``./FACS_benchmark/Sei``)::
+
+    <output_dir>/<cell_line>/Sei_FACS.best.pt
+    <output_dir>/<cell_line>/Sei_FACS_test_predictions.csv
+    <output_dir>/<cell_line>/Sei_FACS_test_metrics.csv
+
+Entry point
+-----------
+    python train_FACS_Sei.py --cell_line K562 --device cuda:0
+
+Deviations from §5.5 (code, not paper)
+-------------------------------------
+Weight decay defaults to 1e-7 (the paper says 0.01 for the FACS experiment),
+validation runs once per epoch rather than every 500 steps, model selection uses
+validation AUROC instead of the m2a composite score, and there is no boosted
+sampler: the script trains with plain ``BCEWithLogitsLoss`` and the batch is
+assembled by a plain permutation.
 """
 import argparse, os, sys, gc, warnings
 warnings.filterwarnings('ignore')
@@ -21,9 +67,34 @@ from load_facs_data import load_facs_for_cell_line
 
 # ── Model ───────────────────────────────────────────────────────────
 class Sei1Head(nn.Module):
-    """Sei backbone + single output head."""
+    """Sei trunk with a single scalar output head.
+
+    Identical trunk to ``train_Sei.Sei5Head`` (three conv stages, five dilated
+    residual convolutions, B-spline compression to 960 * 16 features), with one
+    ``Linear(960 * 16, 512) -> ReLU -> Dropout(0.3) -> Linear(512, 1)`` head
+    because only one cell line is modelled.
+
+    Parameters
+    ----------
+    sequence_length : int, default 4096
+        Declared input width; no layer is sized from it, but the spline basis
+        assumes the length is divisible by 64.
+
+    Notes
+    -----
+    Shape flow: ``(B, 4, 4096)`` -> ``(B, 960, 64)`` -> spline -> ``(B, 15360)``
+    -> one logit. The trunk is duplicated from ``train_Sei.py`` and from
+    ``Sei.Sei_Default``; all three copies must be edited together.
+    """
 
     def __init__(self, sequence_length=4096):
+        """Build the trunk layers and the single head.
+
+        Parameters
+        ----------
+        sequence_length : int, default 4096
+            Declared input width; informational only.
+        """
         super().__init__()
         # Shared Sei backbone
         self.lconv1 = nn.Sequential(
@@ -63,6 +134,18 @@ class Sei1Head(nn.Module):
             nn.Dropout(0.3), nn.Linear(512, 1))
 
     def forward(self, x):
+        """Return one logit per sample.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            One-hot DNA ``(B, 4, 4096)``.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(B,)`` raw logits (``flatten()`` removes the trailing 1).
+        """
         lout1 = self.lconv1(x)
         out1 = self.conv1(lout1)
         lout2 = self.lconv2(out1 + lout1)
@@ -86,6 +169,24 @@ class Sei1Head(nn.Module):
 
 # ── Data ────────────────────────────────────────────────────────────
 def pad_to_4096(seq_np):
+    """Centre-pad or centre-crop a one-hot array to exactly 4,096 bp.
+
+    Parameters
+    ----------
+    seq_np : numpy.ndarray
+        One-hot DNA ``(N, L, 4)``.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(N, 4096, 4)`` of the same dtype; zero-padded when shorter, cropped
+        from the centre when longer.
+
+    Notes
+    -----
+    Zero padding creates all-zero columns, which is *not* the same as padding
+    with N. Byte-for-byte duplicate of the helper in ``train_Sei.py``.
+    """
     n, l, c = seq_np.shape
     if l == 4096: return seq_np
     if l > 4096:
@@ -100,6 +201,41 @@ def pad_to_4096(seq_np):
 def train_sei_facs(cell_line, device='cuda:0', epochs=50, batch_size=32,
                    lr=1e-3, weight_decay=1e-7, earlystop=10,
                    output_dir='./FACS_benchmark/Sei'):
+    """Train Sei on the FACS readout of a single cell line.
+
+    Parameters
+    ----------
+    cell_line : {'K562', 'hPSC'}
+        FACS cell line; one independent model per line.
+    device : str, default 'cuda:0'
+        Torch device string (hard-coded default).
+    epochs : int, default 50
+        Maximum number of epochs.
+    batch_size : int, default 32
+        Training batch size, as for the other Sei runs (the 4,096 bp input
+        makes larger batches expensive).
+    lr : float, default 1e-3
+        AdamW learning rate (matches §5.5).
+    weight_decay : float, default 1e-7
+        AdamW weight decay. §5.5 reports 0.01 for the FACS experiment, so this
+        default does not reproduce the paper.
+    earlystop : int, default 10
+        Epochs without validation-AUROC improvement before stopping.
+    output_dir : str, default './FACS_benchmark/Sei'
+        Root directory; artefacts go to ``<output_dir>/<cell_line>/``.
+
+    Returns
+    -------
+    dict
+        ``{'cell_line', 'model', 'AUROC', 'AUPRC', 'n_pos', 'n_neg'}`` on the
+        held-out test split.
+
+    Notes
+    -----
+    Plain ``BCEWithLogitsLoss``, global gradient clipping at norm 1.0, no
+    class-balanced sampler, and epoch-level rather than step-level validation
+    -- all simplified relative to §5.5.
+    """
     print(f'\n[1/4] Loading FACS data for {cell_line}...')
     trainset, validset, testset = load_facs_for_cell_line(cell_line)
 
@@ -124,8 +260,14 @@ def train_sei_facs(cell_line, device='cuda:0', epochs=50, batch_size=32,
     valid_count = 0
 
     # Validation tensors (keep on CPU, send in batches)
+    # Validation (and later test) windows are padded once and kept in host memory,
+    # then copied to the device batch by batch. At 4,096 bp x 4 channels this is
+    # 64 KB per sample in float32, which is why the full padded training split is
+    # never held as a single tensor.
     val_seq_all = pad_to_4096(validset['sequence']).transpose(0, 2, 1).astype(np.float32)
     val_y = validset['label']
+    # ``val_batch_size`` is reused for the test pass below, under the assumption
+    # that both splits are of comparable size.
     val_batch_size = min(32, len(val_y))
 
     for epoch in range(epochs):
@@ -134,6 +276,9 @@ def train_sei_facs(cell_line, device='cuda:0', epochs=50, batch_size=32,
         indices = np.random.permutation(trainset['length'])
         for i in range(0, trainset['length'], batch_size):
             batch_idx = indices[i:i + batch_size]
+            # Padding is redone for every batch (and every epoch) rather than once
+            # for the whole split: it trades host memory for CPU time, which is the
+            # cheaper side of the trade at this batch size.
             x_np = pad_to_4096(trainset['sequence'][batch_idx]).transpose(0, 2, 1)
             x = torch.tensor(x_np, dtype=torch.float, device=device)
             y = torch.tensor(trainset['label'][batch_idx], dtype=torch.float, device=device)
@@ -209,6 +354,7 @@ def train_sei_facs(cell_line, device='cuda:0', epochs=50, batch_size=32,
 
 
 def main():
+    """Parse CLI arguments, run :func:`train_sei_facs`, print the test AUROC."""
     parser = argparse.ArgumentParser(description='Sei FACS training')
     parser.add_argument('--cell_line', default='K562', choices=['K562', 'hPSC'])
     parser.add_argument('--device', default='cuda:0')
