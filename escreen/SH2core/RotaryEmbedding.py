@@ -1,3 +1,41 @@
+"""Rotary position embeddings (RoPE) for the eScreen attention block.
+
+Provides the RoPE autograd wrappers and the :class:`RotaryEmbedding` module used
+by :class:`~.MHA.MHA`.  In eScreen, ``AttentionBlock`` builds its attention with
+``rotary_emb_dim = hidden_size // num_attention_heads`` (the full head width) and
+``rotary_emb_base = 1e6``, so every Q/K channel is rotated and no channel is left
+un-rotated.
+
+What RoPE does
+--------------
+For a head vector ``x`` of width ``d`` split into ``d/2`` channel pairs, position
+``t`` maps to the angle ``theta_i * t`` with ``theta_i = base^(-2i/d)``.  Each pair
+is rotated by that angle::
+
+    [x_{2i}  ]   [ cos(t theta_i)  -sin(t theta_i) ] [x_{2i}  ]
+    [x_{2i+1}] = [ sin(t theta_i)   cos(t theta_i) ] [x_{2i+1}]
+
+Because ``R(a) R(b)^T = R(a - b)``, the dot product of a query at position ``t``
+with a key at position ``s`` depends only on ``t - s``: the position information
+enters the attention logits as a relative offset, and no positional vector is
+added to the embeddings.
+
+Implementation notes
+--------------------
+* All rotations are executed by the Triton kernel in :mod:`ops`
+  (``ops.apply_rotary``); the functions here only prepare cos/sin, dispatch, and
+  provide the backward pass, which re-runs the kernel with ``conjugate=True``
+  because rotation matrices are orthogonal.
+* Two channel-pairing conventions are supported: ``interleaved=False`` pairs
+  channel ``i`` with ``i + d/2`` (GPT-NeoX style, what eScreen uses) and
+  ``interleaved=True`` pairs ``2i`` with ``2i+1`` (GPT-J style).
+* Tensors are rotated **in place** wherever the kernel allows it; the wrappers
+  therefore mutate their inputs, which is why callers pass freshly projected Q/K/V
+  and never a view of the residual stream.
+
+Adapted from the StripedHyena2 / flash-attention implementation.
+"""
+
 import torch
 from einops import rearrange, repeat
 from typing import Optional, Tuple, Union
@@ -7,6 +45,30 @@ from .ops import apply_rotary
 
 
 def rotate_half(x, interleaved=False):
+    """Rotate the paired channels of the last dimension by +90 degrees.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        ``[..., rotary_dim]``; the last axis holds the paired channels.
+    interleaved : bool, optional
+        ``False`` (default, GPT-NeoX): pair ``x[i]`` with ``x[i + d/2]``.
+        ``True`` (GPT-J): pair the adjacent ``x[2i]`` / ``x[2i+1]``.
+
+    Returns
+    -------
+    torch.Tensor
+        ``[-x2, x1]`` with the same shape and dtype as ``x`` -- the vector rotated
+        by +90 degrees inside every 2-D subspace.
+
+    Notes
+    -----
+    Only used by :func:`apply_rotary_emb_torch`, i.e. by the pure-PyTorch
+    reference implementation; the path eScreen runs is the Triton kernel in
+    ``ops.rotary_kernel``, which performs the same rotation without materialising
+    this intermediate.  The two conventions differ merely in how channels are
+    paired, so mixing them yields a plausible but wrong rotation.
+    """
     if not interleaved:
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
@@ -20,6 +82,13 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
     x: (batch_size, seqlen, nheads, headdim)
     cos, sin: (seqlen, rotary_dim / 2) or (batch_size, seqlen, rotary_dim / 2)
     """
+    # Pure-PyTorch reference implementation (not used by the model; it is the
+    # oracle for ops.apply_rotary).  The two ``repeat`` patterns encode the two
+    # pairing conventions: "(2 d)" duplicates each angle for the even/odd slot of a
+    # half-split pair, "(d 2)" duplicates it for adjacent pairs.  The trailing
+    # ``x[..., ro_dim:]`` keeps channels beyond rotary_dim unrotated, because the
+    # rotary width may be smaller than the head width (not the case in eScreen,
+    # where rotary_dim == head_dim).
     ro_dim = cos.shape[-1] * 2
     assert ro_dim <= x.shape[-1]
     cos = repeat(cos, "... d -> ... 1 (2 d)" if not interleaved else "... d -> ... 1 (d 2)")
@@ -34,6 +103,16 @@ def apply_rotary_emb_torch(x, cos, sin, interleaved=False):
 
 
 class ApplyRotaryEmb(torch.autograd.Function):
+    """Autograd wrapper around the Triton RoPE kernel for a single tensor.
+
+    ``forward`` rotates ``x``; ``backward`` re-applies the same kernel with
+    ``conjugate=True``.  That is exact rather than an approximation: a rotation
+    matrix ``R`` satisfies ``dL/dx = R^T dL/dy = R(-theta) dL/dy``, so the
+    transposed Jacobian is just the rotation by the negative angle.
+
+    Tensors are ``[B, L, H, D]`` (or ``[total, H, D]`` with ``cu_seqlens``), cos/sin
+    are ``[seqlen_ro, rotary_dim/2]``.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -46,6 +125,31 @@ class ApplyRotaryEmb(torch.autograd.Function):
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
     ):
+        """Rotate ``x`` and record the parameters that backward needs.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            ``[B, L, H, D]``, or ``[total, H, D]`` when ``cu_seqlens`` is given.
+        cos, sin : torch.Tensor
+            ``[seqlen_ro, rotary_dim/2]``, same dtype as ``x`` (asserted in
+            ``ops.apply_rotary``).
+        interleaved : bool, optional
+            Pairing convention (see :func:`rotate_half`).
+        inplace : bool, optional
+            Overwrite ``x`` instead of writing to a new tensor.
+        seqlen_offsets : int or torch.Tensor, optional
+            Position offset(s); a tensor of shape ``[B]`` is used with a KV cache.
+        cu_seqlens : torch.Tensor, optional
+            Cumulative lengths for variable-length batching.
+        max_seqlen : int, optional
+            Required when ``cu_seqlens`` is given.
+
+        Returns
+        -------
+        torch.Tensor
+            The rotated tensor (``x`` itself when ``inplace``).
+        """
         out = apply_rotary(
             x,
             cos,
@@ -69,6 +173,25 @@ class ApplyRotaryEmb(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
+        """Back-propagate through the rotation.
+
+        Parameters
+        ----------
+        do : torch.Tensor
+            Gradient w.r.t. the forward output, same shape as ``x``.
+
+        Returns
+        -------
+        tuple
+            ``(dx, None, None, None, None, None, None, None)`` -- one gradient for
+            each forward argument, only ``x`` being differentiable.
+
+        Notes
+        -----
+        The ``do.clone()`` below is a workaround for a Triton 2.0
+        "invalid device context" error when the kernel runs in place on a
+        non-contiguous gradient; it is kept as in the upstream code.
+        """
         seqlen_offsets = ctx.seqlen_offsets
         if seqlen_offsets is None:
             cos, sin, cu_seqlens, seqlen_offsets = ctx.saved_tensors
@@ -120,6 +243,9 @@ def apply_rotary_emb(
     rotary_dim must be <= headdim
     Apply rotary embedding to the first rotary_dim of x.
     """
+    # Public entry point: thin dispatch to the autograd Function above.  Because
+    # the Function rotates in place, the returned tensor may alias ``x`` -- callers
+    # must not reuse the input afterwards.
     return ApplyRotaryEmb.apply(x, cos, sin, interleaved, inplace, seqlen_offsets, cu_seqlens, max_seqlen)
 
 
@@ -128,6 +254,21 @@ apply_rotary_emb_func = apply_rotary_emb
 
 
 class ApplyRotaryEmbQKV_(torch.autograd.Function):
+    """Autograd wrapper that rotates Q and K inside a packed QKV tensor in place.
+
+    The packed tensor is either ``[B, L, 3, H, D]`` or, for grouped-query
+    attention, ``[B, L, H_q + 2 H_kv, D]`` (then ``num_heads_q`` is required).
+    Only the query and key slices are rotated; the value slice is untouched.
+
+    A single kernel launch is used when ``cos_k``/``sin_k`` are not supplied and
+    the tensor is contiguous: the ``(3, H)`` axes are then merged into one
+    ``(3H)`` axis, which is the same memory as the separate slices.
+
+    Returns
+    -------
+    torch.Tensor
+        The same (mutated) tensor.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -140,6 +281,35 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
         seqlen_offsets: Union[int, torch.Tensor] = 0,
         num_heads_q: Union[int] = None,
     ):
+        """Rotate the Q and K slices of ``qkv`` in place.
+
+        Parameters
+        ----------
+        qkv : torch.Tensor
+            ``[B, L, 3, H, D]`` or ``[B, L, H_q + 2 H_kv, D]``.
+        cos, sin : torch.Tensor
+            ``[seqlen_ro, rotary_dim/2]`` used for the query (and for the key when
+            no separate key tables are given).
+        cos_k, sin_k : torch.Tensor, optional
+            Separate tables for the key, needed for XPos-style scaling.
+        interleaved : bool, optional
+            Pairing convention.
+        seqlen_offsets : int or torch.Tensor, optional
+            Position offset(s).
+        num_heads_q : int, optional
+            Required when ``qkv`` is 4-D (MQA/GQA layout).
+
+        Returns
+        -------
+        torch.Tensor
+            ``qkv``, rotated in place.
+
+        Notes
+        -----
+        ``ctx.save_for_backward`` is called in both branches below; repeated calls
+        append to the context rather than replacing, so the second call is
+        redundant but harmless.
+        """
         if cos_k is None and sin_k is None and qkv.is_contiguous():
             # Call 1 kernel instead of 2 kernels
             # We need qkv to be contiguous so that when we reshape to combine (3, nheads)
@@ -192,6 +362,18 @@ class ApplyRotaryEmbQKV_(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dqkv):
+        """Rotate the Q/K gradient slices back (conjugate rotation).
+
+        Parameters
+        ----------
+        dqkv : torch.Tensor
+            Gradient w.r.t. the packed tensor.
+
+        Returns
+        -------
+        tuple
+            ``(dqkv, None, None, None, None, None, None, None)``.
+        """
         seqlen_offsets = ctx.seqlen_offsets
         if seqlen_offsets is None:
             cos, sin, cos_k, sin_k, seqlen_offsets = ctx.saved_tensors
@@ -277,10 +459,21 @@ def apply_rotary_emb_qkv_(
     rotary_dim must be <= headdim
     Apply rotary embedding *inplace* to the first rotary_dim of Q and K.
     """
+    # As with the single-tensor wrapper, this mutates ``qkv`` in place and returns
+    # the same object, so the caller's projection buffer is overwritten.  eScreen
+    # is fine with that: MHA applies RoPE to the fresh ``Wqkv`` output and never
+    # needs the un-rotated Q/K again.
     return ApplyRotaryEmbQKV_.apply(qkv, cos, sin, cos_k, sin_k, interleaved, seqlen_offsets, num_heads_q)
 
 
 class ApplyRotaryEmbKV_(torch.autograd.Function):
+    """Autograd wrapper that rotates only the key slice of a packed KV tensor.
+
+    ``kv`` is ``[B, L, 2, H, D]`` (key at index 0, value at index 1).  Only the key
+    is rotated, in place; the value is left untouched.  Used for cross-attention
+    and for KV-cache updates, where the query is rotated separately by
+    :func:`apply_rotary_emb`.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -290,6 +483,24 @@ class ApplyRotaryEmbKV_(torch.autograd.Function):
         interleaved=False,
         seqlen_offsets: Union[int, torch.Tensor] = 0,
     ):
+        """Rotate the key slice of ``kv`` in place.
+
+        Parameters
+        ----------
+        kv : torch.Tensor
+            ``[B, L, 2, H, D]``.
+        cos, sin : torch.Tensor
+            ``[seqlen_ro, rotary_dim/2]``.
+        interleaved : bool, optional
+            Pairing convention.
+        seqlen_offsets : int or torch.Tensor, optional
+            Position offset(s).
+
+        Returns
+        -------
+        torch.Tensor
+            ``kv``, key rotated in place.
+        """
         batch, seqlen, two, nheads, headdim = kv.shape
         assert two == 2
         k = kv[:, :, 0]
@@ -312,6 +523,18 @@ class ApplyRotaryEmbKV_(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dkv):
+        """Rotate the key gradient back (conjugate rotation).
+
+        Parameters
+        ----------
+        dkv : torch.Tensor
+            Gradient w.r.t. ``[B, L, 2, H, D]``.
+
+        Returns
+        -------
+        tuple
+            ``(dkv, None, None, None, None)``.
+        """
         seqlen_offsets = ctx.seqlen_offsets
         if seqlen_offsets is None:
             cos, sin, seqlen_offsets = ctx.saved_tensors
@@ -330,6 +553,10 @@ class ApplyRotaryEmbKV_(torch.autograd.Function):
 
 
 apply_rotary_emb_kv_ = ApplyRotaryEmbKV_.apply
+# NOTE: the alias above is immediately shadowed by the ``def`` below (same name),
+# so ``ApplyRotaryEmbKV_.apply`` is not reachable through this name.  The public
+# wrapper is the function, and that is what RotaryEmbedding.forward calls; the
+# assignment is dead code kept from upstream.
 
 
 def apply_rotary_emb_kv_(
@@ -352,6 +579,7 @@ def apply_rotary_emb_kv_(
     rotary_dim must be <= headdim
     Apply rotary embedding *inplace* to the first rotary_dim of K.
     """
+    # Public entry point for the KV-only rotation; see ApplyRotaryEmbKV_ above.
     return ApplyRotaryEmbKV_.apply(kv, cos, sin, interleaved, seqlen_offsets)
 
 
@@ -372,6 +600,8 @@ class RotaryEmbedding(torch.nn.Module):
     A recommended value for scale_base is 512: https://github.com/HazyResearch/flash-attention/issues/96
     Reference: https://github.com/sunyt32/torchscale/blob/main/torchscale/component/xpos_relative_position.py
     """
+    # eScreen instantiates this from MHA with dim = head_dim, base = 1e6 and
+    # interleaved = False (GPT-NeoX pairing over the whole head width).
 
     def __init__(
         self,
@@ -396,6 +626,10 @@ class RotaryEmbedding(torch.nn.Module):
             To maintain compatibility with models previously trained in pure bf16,
             we add this option.
         """
+        # inv_freq and scale are registered with persistent=False: both are pure
+        # functions of `dim` / `base`, so they need not (and should not) be stored in
+        # the checkpoint, which keeps state_dict keys unchanged when the base is
+        # changed in a config.
         super().__init__()
         self.dim = dim
         self.base = float(base)
@@ -419,9 +653,56 @@ class RotaryEmbedding(torch.nn.Module):
         self._sin_k_cached = None
 
     def _compute_inv_freq(self, device=None):
+        """Build the inverse-frequency table ``theta_i = base^(-2i/dim)``.
+
+        Parameters
+        ----------
+        device : torch.device, optional
+            Device for the new tensor.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``[dim/2]``, dtype float32.
+
+        Notes
+        -----
+        float32 is deliberate even when the model runs in bfloat16: these values are
+        multiplied by position indices up to L, and in bf16 the resulting angles
+        would be quantised so coarsely that different positions could collide (see
+        the ``pos_idx_in_fp32`` note in :meth:`__init__`).
+        """
         return 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim))
 
     def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):
+        """(Re)build the cached cos/sin tables for ``seqlen`` positions.
+
+        Parameters
+        ----------
+        seqlen : int
+            Number of positions to cover.
+        device : torch.device, optional
+            Device of the cache.
+        dtype : torch.dtype, optional
+            dtype the tables are stored in (matches the q/k dtype, bfloat16 in
+            eScreen).
+
+        Returns
+        -------
+        None
+            The tables are written to ``self._cos_cached`` / ``self._sin_cached``
+            (and ``_cos_k_cached`` / ``_sin_k_cached`` for XPos).
+
+        Notes
+        -----
+        * The cache is rebuilt only when it grows, changes device/dtype, or when
+          switching from inference to training mode; a shorter sequence simply
+          reuses the longer table and indexes its first positions.
+        * Angles are computed in float32 and only the final cos/sin are cast, so the
+          bf16 rounding happens once per table entry instead of once per use.
+        * ``torch.outer(t, inv_freq)`` is used instead of ``einsum`` on purpose:
+          einsum would down-cast float32 to fp16 under AMP.
+        """
         # Reset the tables if the sequence length has changed,
         # if we're on a new device (possibly due to tracing for instance),
         # or if we're switching from inference mode to training
@@ -486,6 +767,10 @@ class RotaryEmbedding(torch.nn.Module):
             should pass in max_seqlen, which will update the cos / sin cache up to that length.
         Apply rotary embedding *inplace* to qkv and / or kv.
         """
+        # The table is sized from `max_seqlen` when a per-sample offset tensor is
+        # used (KV-cache decoding), otherwise from seqlen + a constant offset --
+        # otherwise positions beyond the cached range would read a stale table.
+        # The rotation itself then runs at qkv.dtype (bfloat16 in eScreen).
         seqlen = qkv.shape[1]
         if max_seqlen is not None:
             self._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)

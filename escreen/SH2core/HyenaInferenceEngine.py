@@ -1,3 +1,37 @@
+"""Kernels behind the Hyena operator: FFT convolutions and FIR/IIR state handling.
+
+Provides
+
+* :func:`fftconv_standard` -- standalone FFT cross-correlation used as the
+  reference long convolution; ``escreen/escreen.py`` imports it (though the
+  current forward pass does not call it).
+* :func:`fftconv_func` -- the (optionally bidirectional) FFT convolution used by
+  the long filter of every ``HyenaCascade``.
+* :class:`HyenaInferenceEngine` -- dispatcher that applies the short FIR filter
+  (``parallel_fir`` / ``step_fir``), the long IIR filter (``parallel_iir`` /
+  ``step_iir``) and builds decoding caches (``prefill_via_*``; most raise
+  ``NotImplementedError``).
+* :class:`HyenaFilter` -- a vestigial helper class; the file ends in the middle of
+  it (see the note there), so it is incomplete and unused.
+
+Role in eScreen
+---------------
+Each ``HyenaCascade`` (hence each of the three Hyena blocks) owns one engine.  Only
+the *parallel* whole-sequence path is ever exercised, because eScreen never passes
+``inference_params``; the recurrent/step paths exist for autoregressive decoding.
+
+Numerical conventions
+---------------------
+* Filters are applied as correlations: the kernel spectrum is conjugated, and the
+  result is truncated to the causal part.  A plain conv1d is used with
+  ``padding = kernel_len - 1`` and then ``[..., :L]``, which is the same
+  left-aligned (causal) window.
+* All filter multiplications are promoted to float32 and cast back to the input
+  dtype, so the bfloat16 model of §2.1 keeps a numerically stable filter response.
+
+Adapted from the StripedHyena2 reference implementation.
+"""
+
 import gc
 
 import torch
@@ -14,6 +48,9 @@ def column_split(x, num_heads, head_size):
     """Split a tensor with `num_heads` alongside the head dimension, instead of
     across heads. Fixed to three projections
     """
+    # NOTE the ordering: the first third of the channel axis becomes x2, the second
+    # becomes x1 and the third becomes v -- i.e. x2 comes *before* x1 here, matching
+    # the checkpoint layout, not the (x1, x2, v) reading order used in the comments.
     # FIXME: merge cases
     if len(x.shape) == 2:
         x_reshaped = x.reshape(
@@ -66,9 +103,35 @@ IIR_PREFILL_MODES = [
     "canonical-fft",
     "iir-fir-caching",
 ]
+# Accepted values of the KV-cache prefill strategy.  Only "modal-fft" and
+# "recurrence" have implementations; the rest raise NotImplementedError inside
+# HyenaInferenceEngine.  HyenaCascade never passes one, so the default
+# "modal-fft" applies -- and in eScreen even that is never reached, because no
+# inference_params object is ever supplied.
 
 
 def adjust_filter_shape_for_broadcast(u, h):
+    """Reshape a filter spectrum so that it broadcasts against the signal.
+
+    Parameters
+    ----------
+    u : torch.Tensor
+        Signal used only for its rank: ``[B, D, L]`` or ``[B, D1, D2, L]``.
+    h : torch.Tensor
+        Filter spectrum with shape ``[1, D, L]`` or ``[D, 1, L]`` (or unbatched
+        ``[D, L]``).
+
+    Returns
+    -------
+    torch.Tensor
+        ``h`` with a leading batch axis when ``u`` is batched (and an extra
+        broadcast axis for the 4-D case).
+
+    Notes
+    -----
+    ``h.squeeze()`` collapses both supported layouts to ``[D, L]``; that is only
+    safe because exactly one of the two middle axes is always 1 in the callers.
+    """
     h = h.squeeze()  # Standardize to [D, L] from [1, D, L] and [D, 1, L]
 
     # Case: u: [B, D, L], k_f: [D, L]
@@ -84,6 +147,32 @@ def adjust_filter_shape_for_broadcast(u, h):
 
 
 def complex_matmul(a, b, device='cpu'):
+    """Multiply two complex tensors with batched (batched-over-``...``) matmul.
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        complex64 of shape ``[A, ..., L]``.
+    b : torch.Tensor
+        complex64 of shape ``[C, ..., L]``.
+    device : str or torch.device, optional
+        Device for the output buffer (must match the inputs).
+
+    Returns
+    -------
+    torch.Tensor
+        complex64 of shape ``[A, C, ..., L]``.
+
+    Notes
+    -----
+    The einsum pattern ``"ab..., cb... -> ac..."`` treats the first two axes as the
+    matrix axes -- the opposite of the usual convention -- which is why both
+    callers pass spectra whose leading axis is the (size-1) kernel axis.  Complex
+    multiplication is written out as four real products because a complex einsum
+    is not a single fused kernel.  The result is assembled through a freshly
+    allocated real/imag pair, so the function is not autograd-friendly for complex
+    leaves but is safe for the convolution use here.
+    """
     """Multiplies two complex-valued tensors."""
     scalar_matmul = partial(torch.einsum, "ab..., cb... -> ac...")
 
@@ -104,6 +193,11 @@ def fftconv_standard(signal, kernel, bias = None, padding = 0, device='cpu'):
     Returns:
         (Tensor) Convolved tensor
     """
+    # Conjugating the kernel spectrum turns the circular *convolution* produced by
+    # the FFT product into a circular *correlation*; the truncation below then keeps
+    # the L_signal - L_kernel + 1 fully-overlapping (causal) positions.  The
+    # `padding` argument only widens the analysed window, it does not shift the
+    # alignment of the result.
     # 1. Pad the input signal & kernel tensors
     signal = F.pad(signal, [padding, padding])
     kernel_padding = [0, signal.size(-1) - kernel.size(-1)]
@@ -139,6 +233,50 @@ def fftconv_func(
     layer_idx=None,
     **kwargs,
 ):
+    """FFT convolution of ``u`` with a learnable filter, optionally two-sided.
+
+    Parameters
+    ----------
+    u : torch.Tensor
+        ``[B, D, L]`` input signal (float32 by the time it arrives here).
+    k : torch.Tensor
+        ``[1, D, L]`` (or ``[D, L]``) learnable filter.
+    D : torch.Tensor
+        ``[D]`` feed-through gain applied as ``u * D`` and added to the result.
+    dropout_mask : None
+        Unused; kept for upstream signature compatibility.
+    gelu : bool, optional
+        Unused flag -- no activation is applied inside this function.
+    k_rev : torch.Tensor, optional
+        Time-reversed filter; only used when ``bidirectional`` is False, where its
+        conjugated spectrum is added to the forward kernel.
+    bidirectional : bool, optional
+        If True, the filter is split along its time axis: the first half is applied
+        forward and the second half is applied to the time-reversed signal
+        (``conj(u_f) * conj(k2_f)``).  This is what lets one long filter integrate
+        both upstream and downstream context -- the mechanism behind the
+        "no explicit causal mask" design of §2.1.
+    layer_idx : int, optional
+        Unused here (debug hook).
+    **kwargs
+        Absorbed and ignored (``groups`` is passed by the caller but not used).
+
+    Returns
+    -------
+    torch.Tensor
+        ``[B, D, L]``, cast back to ``u.dtype``.
+
+    Notes
+    -----
+    * ``fft_size = 2 * L``: a length-L circular convolution would wrap the filter
+      tail onto the head of the signal, so both operands are zero-padded to 2L and
+      only the first L output samples are kept (the linear, causal part).
+    * The ``/ fft_size`` on the kernel spectrum and ``norm="forward"`` on the inverse
+      transform are a *matched pair* inherited from upstream.  Changing one without
+      the other rescales the effective filter gain by a factor of L.
+    * ``k.split(k.shape[1] // 2, dim=1)`` splits the *time* axis (the filter has been
+      squeezed to ``[D, L]``), not the channel axis.
+    """
     seqlen = u.shape[-1]
     fft_size = 2 * seqlen
 
@@ -165,6 +303,9 @@ def fftconv_func(
         y = torch.fft.irfft(u_f * k_f, n=fft_size, norm="forward")[..., :seqlen]
 
     out = y + u * D.unsqueeze(-1)
+    # Learnable feed-through (skip) term: the long filter already implies a skip
+    # path, and making it explicit lets each channel learn how much of the raw
+    # signal to pass through un-filtered.
 
     return out.to(dtype=u.dtype)
 
@@ -179,10 +320,29 @@ def canonicalize_modal_system(poles, residues):
     Returns:
         Tuple[Tensor, Tensor]: The canonicalized poles and residues.
     """
+    # Unimplemented in this vendored copy: no caller in eScreen reaches it (the
+    # canonical (real) form is never used; the modal form is used instead).
     raise NotImplementedError
 
 
 def list_tensors(idx):
+    """Dump every live torch tensor in the process to ``tensors_<idx>.txt``.
+
+    Parameters
+    ----------
+    idx : int
+        Suffix of the output file (appended on every call).
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Debug helper only: it walks ``gc.get_objects()``, which is extremely slow and
+    unsafe while training (it touches unrelated live objects).  Nothing in the
+    model calls it.
+    """
     for obj in gc.get_objects():
         try:
             if torch.is_tensor(obj) and isinstance(obj, torch.Tensor):
@@ -196,6 +356,41 @@ def list_tensors(idx):
 
 
 class HyenaInferenceEngine:
+    """Dispatcher for the FIR/IIR kernels of one Hyena layer.
+
+    One instance is created per ``HyenaCascade``.  The object holds no tensors --
+    only the layer index and a handful of switches -- and exposes:
+
+    * ``parallel_fir`` / ``parallel_iir`` -- whole-sequence (training) computation;
+    * ``step_fir`` / ``step_iir`` -- one-token recurrence used for decoding;
+    * ``prefill_via_*`` -- state-cache construction (most raise
+      ``NotImplementedError``);
+    * ``_compute_state`` -- modal state for a whole sequence.
+
+    Parameters
+    ----------
+    fir_fn : callable, optional
+        Short-filter convolution.  Stored as ``self.fir_fn`` but never read: every
+        method receives its convolution function as an argument.
+    iir_prefill_style : str, optional
+        Must be one of ``IIR_PREFILL_MODES`` (asserted in the body); default
+        ``"modal-fft"``.
+    layer_idx : int, optional
+        Block index, used as the key into the FIR/IIR state dictionaries.
+    ground_truth_activations_path : str, optional
+        Stored and never read -- a debugging leftover from the upstream repo.
+    hyena_flip_x1x2 : bool, optional
+        Swap the roles of ``x1`` and ``x2`` inside the gated branches.
+    bidirectional : bool, optional
+        Accepted but **not stored**; each method takes its own ``bidirectional``
+        argument, which is the value ``HyenaCascade`` passes down.
+
+    Notes
+    -----
+    ``low_mem_mode`` is hard-coded to ``False`` and only consulted at the end of
+    ``parallel_iir``.  Nothing here is stateful across calls except through the
+    ``inference_params`` object the caller owns.
+    """
     def __init__(
         self,
         fir_fn=None,
@@ -205,6 +400,7 @@ class HyenaInferenceEngine:
         hyena_flip_x1x2=False,
         bidirectional=True
     ) -> None:
+        """Store the switches; no tensors or buffers are allocated."""
         self.fir_fn = fir_fn
         assert iir_prefill_style in IIR_PREFILL_MODES, f"iir_prefill_style must be one of {IIR_PREFILL_MODES}"
         self.iir_prefill_style = iir_prefill_style
@@ -232,6 +428,67 @@ class HyenaInferenceEngine:
         padding_mask=None,
         bidirectional=True
     ):
+        """Apply a depth-wise FIR filter over the whole sequence.
+
+        Parameters
+        ----------
+        fir_fn : callable
+            ``torch.nn.functional.conv1d`` or a ``FlashDepthWiseConv1d`` instance.
+            The code branches on identity (``fir_fn != F.conv1d``) to pick the
+            flash path.
+        u : torch.Tensor
+            ``[B, L, C]`` when ``dim_last`` else ``[B, C, L]``.
+        weight : torch.Tensor
+            ``[C, 1, L_fir]`` depth-wise kernels (``C = 3D`` for the short filter,
+            ``D`` for the inner filter).
+        bias : torch.Tensor or None
+            Per-channel term; added, or multiplied into ``u`` when ``gated_bias``.
+        L : int
+            Ignored -- the length is re-read from ``u`` on the first line.
+        dims : tuple
+            ``(hidden_size, num_attention_heads, head_dim, state_size, groups)``.
+        groups : int, optional
+            Number of filter groups; used only on the FFT branch.  The conv1d branch
+            always passes ``groups=u.shape[1]``, i.e. strict depth-wise convolution.
+        gated_bias : bool, optional
+            If True the bias enters multiplicatively (``z += bias * u``).
+        column_split_hyena : bool, optional
+            Reinterpret the channel axis as heads before splitting x2/x1/v.
+        dim_last : bool, optional
+            Layout flag for ``u``.
+        fir_length : int, optional
+            Kernel length; ``>= 128`` selects the FFT path, otherwise conv1d.
+        gate : bool, optional
+            If True, split ``u`` into x2/x1/v, convolve ``x1 * v`` and gate by x2.
+        inference_params : optional
+            When given, the trailing ``fir_length - 1`` samples of ``u`` are returned
+            as the cache state.
+        prefill_mode : optional
+            Unused.
+        padding_mask : torch.Tensor, optional
+            ``[B, L]`` mask applied to the output.
+        bidirectional : bool, optional
+            Only honoured on the FFT branch (see Notes).
+
+        Returns
+        -------
+        tuple
+            ``(z, fir_state)``; ``z`` keeps the input layout and dtype, and
+            ``fir_state`` is ``None`` unless ``inference_params`` was supplied.
+
+        Notes
+        -----
+        * ``padding=fir_length - 1`` plus ``[..., :L]`` makes the conv1d branch
+          **causal**: output position t only reads inputs ``<= t``.  Consequently
+          HyenaSE's length-7 inner filter behaves causally even though the block is
+          configured with ``bidirectional=True`` -- that flag only affects the FFT
+          branch below.  This is the one place where the code is narrower than the
+          manuscript's "bidirectional, no causal mask" description.
+        * All arithmetic runs in float32 and is cast back to ``u.dtype``, so the
+          bf16 model does not accumulate filter rounding in bf16.
+        * ``gated_bias`` turns the "bias" into a learned per-channel gain on the
+          input, which is how the Hyena skip term is expressed for long filters.
+        """
         L = u.shape[1] if dim_last else u.shape[2]
         if gate:
             hidden_size, num_attention_heads, hidden_size_per_attention_head, _, _ = dims
@@ -252,6 +509,9 @@ class HyenaInferenceEngine:
             z = fir_fn(u)[:, :L]  # B, L, D
 
         elif fir_length >= 128:
+            # Long-filter branch: an FFT convolution over the *linear* convolution
+            # window.  This is the only branch that honours `bidirectional`, and it is
+            # the path taken by HyenaMR (fir_inner_filter_length = 128).
             with torch.autocast("cuda"):
                 z = fftconv_func(
                     u.to(torch.float32),
@@ -281,6 +541,10 @@ class HyenaInferenceEngine:
                 stride=1,
                 padding=fir_length - 1,
                 groups=u.shape[1],  # always set to D, regardless of filter grouping
+            # NOTE: `groups` is hard-coded to u.shape[1] here, so the conv1d branch is
+            # always strictly depth-wise; the `groups` argument from the caller only
+            # takes effect on the FFT branch above.  The `g` local computed on the
+            # lines above is therefore unused.
             )[..., :L]
 
             z = z.to(u.dtype)
@@ -290,6 +554,9 @@ class HyenaInferenceEngine:
                     z = z + bias[None, :, None] * u
                 else:
                     z = z + bias[None, :, None]
+            # With gated_bias the bias multiplies the input instead of being added:
+            # this is the Hyena skip term (D * x) expressed through the same code
+            # path as a plain bias, which is why D has shape [D] and not [1].
 
         # handle padding post fir, the only place with biases
         if type(padding_mask) == torch.Tensor:
@@ -325,6 +592,22 @@ class HyenaInferenceEngine:
         long_fir_threshold=None,
     ):
         """Compute the output state of the short convolutional filter."""
+        # Parameters (the one-line summary above is kept; details here):
+        #   z_pre          [B, 3D, L]   output of the short FIR filter
+        #   h              [1, D, L]    long filter (impulse response), or None
+        #   D              [D]          learnable feed-through gain
+        #   L              int          sequence length
+        #   poles          [G, S, 1]    log-poles of the modal system (only used by
+        #                               the prefill/step paths, not in the FFT path)
+        #   residues       [G, S]       modal residues (likewise unused here)
+        #   t              unused here (only prefill_via_modal_fft needs positions)
+        #   dims           5-tuple      (D, H, D/H, state_size, groups)
+        #   prefill_style / use_flashfft / fftconv_fn / column_split_hyena /
+        #   long_fir_threshold are read only by the optional branches below; with
+        #   eScreen's settings (inference_params=None, use_flashfft=False,
+        #   long_fir_threshold=None) they are inert.
+        #
+        # Returns [B, L, D]: the gated result transposed back to channel-last.
         fft_size = 2 * L
         hidden_size, num_attention_heads, hidden_size_per_attention_head, _, _ = dims
         # Compatibility with training infra that column splits the projections
@@ -352,6 +635,9 @@ class HyenaInferenceEngine:
         else:
             x2, x1, v = z_pre.split([hidden_size, hidden_size, hidden_size], dim=1)
 
+        # The x2/x1/v split mirrors HyenaCascade's projection order (see
+        # column_split above).  x1 * v is the "input" of the long filter and x2 is the
+        # gate applied afterwards.
         if self.hyena_flip_x1x2:
             x1, x2 = x2, x1
 
@@ -396,6 +682,9 @@ class HyenaInferenceEngine:
 
         y = y.to(dtype=x1v.dtype)
         y = (y + x1v * D.unsqueeze(-1)) * x2
+        # Gated output: long_filter(x1 * v) + D * (x1 * v), then multiplied
+        # element-wise by x2.  The multiplication happens here, not inside the
+        # convolution, so it stays cheap in whatever dtype the activations are.
 
         if inference_params is not None:
             if prefill_style == "fft":
@@ -423,6 +712,7 @@ class HyenaInferenceEngine:
                 torch.cuda.empty_cache()
 
         return y.permute(0, 2, 1)
+        # (B, D, L) -> (B, L, D) so the caller can feed a Linear layer directly.
 
     def step_fir(self, u, fir_state, weight, bias=None, gated_bias=False, flip_filter=False):
         """Steps forward FIR filters in the architecture.
@@ -435,6 +725,8 @@ class HyenaInferenceEngine:
             `fir_state` contains the last FIR filter length - 1 elements of `u`: `u_(L-2), u_{L-1), ...`
             We assume dimensions of `short_filter_weight` to be `[d, 1, short_filter_len]`.
         """
+        # Only the last `fir_length - 1` samples are needed as the recurrent state:
+        # the next step's window is these samples followed by the new token.
         weight = weight.squeeze()
 
         cache_size = fir_state.shape[-1]
@@ -470,9 +762,44 @@ class HyenaInferenceEngine:
         return y.to(input_dtype), fir_state
 
     def step_iir(self, x2, x1, v, D, residues, poles, iir_state, iir_groups=1):
+        """Advance the modal IIR filter by one token.
+
+        Parameters
+        ----------
+        x2 : torch.Tensor
+            ``[B, D]`` gate.
+        x1 : torch.Tensor
+            ``[B, D]`` input of the filter.
+        v : torch.Tensor
+            ``[B, D]`` value branch.
+        D : torch.Tensor
+            ``[D]`` feed-through gain.
+        residues : torch.Tensor
+            ``[G, S]`` modal residues (float32).
+        poles : torch.Tensor
+            ``[G, S, 1]`` **log**-poles (float32).
+        iir_state : torch.Tensor
+            ``[B, G, S]`` recurrent state, updated and returned.
+        iir_groups : int, optional
+            Only ``1`` is implemented.
+
+        Returns
+        -------
+        tuple
+            ``(y, iir_state)`` with ``y`` of shape ``[B, D]``.
+
+        Notes
+        -----
+        The recurrence is ``state <- exp(pole) * state + x1 * v`` and the output is
+        ``(residues . state + D * x1 * v) * x2`` -- the discrete-time form of the
+        continuous filter ``sum_k r_k exp(p_k t)``, i.e. exactly the filter that
+        ``HyenaCascade.compute_filter`` materialises in the parallel path.
+        """
         # TODO: kernelize
         x1v = x1 * v
         poles = torch.exp(poles)  # poles arg contains log_poles
+        # exp() converts the stored log-poles back to poles; keeping them in log
+        # space during training guarantees a positive (stable) decay factor.
         poles = poles[..., 0][None]  # squeeze dummy seqlen dim and add dummy batch dim
         residues = residues[None]  # add dummy batch dim
         iir_state = poles * iir_state + x1v[..., None]
@@ -500,6 +827,10 @@ class HyenaInferenceEngine:
         Note:
             dtypes: [state: float32, poles: float32, x1v: bfloat16, output: bfloat16]
         """
+        # Note the dtype contract of the upstream docstring: state/poles float32,
+        # x1v and the returned output bfloat16.  The interleaved real/imaginary
+        # state (``[..., sdim, 2]``) is how the original complex recurrence is
+        # carried without complex tensors.
         state_dim = poles.shape[1]
         x1v_ = x1v[..., None, None]  # b, d, l, sdim, reim
         x1v_ = x1v_.repeat(1, 1, 1, state_dim, 2)  # b, d, l, sdim, reim
@@ -529,8 +860,26 @@ class HyenaInferenceEngine:
         Compute the IIR state via hybrid recurrence-convolution over blocks
         """
         raise NotImplementedError(":)")
+        # Blocked recurrence/convolution hybrid: never implemented here, and
+        # unreachable from eScreen, which never prefills a cache.
 
     def prefill_via_scan(self, u, inference_params=None, *args, **kwargs):
+        """Parallel-scan prefill of the IIR state (not implemented in this copy).
+
+        Parameters
+        ----------
+        u : torch.Tensor
+            Filter input.
+        inference_params : optional
+            Target state holder.
+        *args, **kwargs
+            Ignored.
+
+        Returns
+        -------
+        None
+            Always raises NotImplementedError.
+        """
         raise NotImplementedError
 
     def prefill_via_canonical_fft(self, u, inference_params=None, *args, **kwargs):
@@ -542,6 +891,9 @@ class HyenaInferenceEngine:
         From: https://arxiv.org/abs/2310.18780
         """
         raise NotImplementedError(":)")
+        # Unimplemented: the canonical (real-valued) FFT prefill described in
+        # arXiv:2310.18780 was not ported.  The modal variant below is the one that
+        # exists; neither is used by eScreen.
 
     def prefill_via_modal_fft(
         self,
@@ -562,6 +914,11 @@ class HyenaInferenceEngine:
         """
         Compute the IIR state via a single FFT
         """
+        # Implementation note: this is the "modal-fft" prefill -- the whole input is
+        # transformed once (X_s, already computed by parallel_iir) and multiplied by
+        # the FFT of exp(poles * t), whose value at index L-1 is exactly the final
+        # state of the recurrence.  It is O(L log L) instead of the O(L) recurrence,
+        # but runs entirely in parallel on the GPU.
         # When the model has a long convolution derived from a recurrence in modal form and prefill_style is "fft",
         # we split the filter into poles and residues and reuse FFT computation on the input.
         hidden_size, _, _, state_size, hyena_filter_groups = dims
@@ -583,6 +940,10 @@ class HyenaInferenceEngine:
         """
         Compute the IIR state given an input `u` and log_poles of the modal system.
         """
+        # Same modal trick as prefill_via_modal_fft, but kept for callers that only
+        # want the state (returns the whole state sequence, not just its last row).
+        # U is computed with rfft while X uses the full fft: the product is valid
+        # because irfft/fft here are applied to the same length-2L grid.
         bs = u.shape[0]
         fft_size = 2 * L
         U = torch.fft.rfft(u.to(torch.float32), n=fft_size)
@@ -596,12 +957,19 @@ class HyenaInferenceEngine:
 
 class HyenaFilter:
     """Handles Hyena filter computations including FFT and direct convolution."""
+    # NOTE: this class is incomplete in this repository -- the file ends after
+    # _prepare_filter, so `fft_conv` calls a `_compute_fft_conv` method that is never
+    # defined (AttributeError if used).  Nothing in eScreen instantiates
+    # HyenaFilter; the convolution actually used is fftconv_func above.
 
     def __init__(self, use_flash_fft=False):
+        """Store the "use flash fft" switch (read nowhere in this class)."""
         self.use_flash_fft = use_flash_fft
 
     def fft_conv(self, u, k, D, **kwargs):
         """FFT-based convolution implementation."""
+        # Adds the feed-through term u * D to the FFT convolution result; note that
+        # self._compute_fft_conv does not exist (see the class note above).
         seqlen = u.shape[-1]
         fft_size = 2 * seqlen
 
@@ -612,5 +980,9 @@ class HyenaFilter:
 
     def _prepare_filter(self, k, u, fft_size):
         """Prepare filter for FFT convolution."""
+        # Pre-divides the kernel spectrum by fft_size so that the inverse transform
+        # (which upstream applies with norm="forward") yields the unscaled
+        # convolution; see the note in fftconv_func for why the two factors are a
+        # matched pair.
         k_f = torch.fft.rfft(k, n=fft_size) / fft_size
         return adjust_filter_shape_for_broadcast(u, k_f)

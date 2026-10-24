@@ -1,3 +1,36 @@
+"""Multi-head attention (self and cross) with RoPE, GQA and KV-cache decoding.
+
+Provides the flash-attention style attention stack used by
+:class:`~.AttentionBlock.AttentionBlock`, the fourth block of the eScreen backbone
+(Supplementary Methods §2.1)::
+
+    MHA                      # projection + RoPE + residual-free attention core
+      |-- SelfAttention      # torch.nn.functional.scaled_dot_product_attention
+      |-- FlashSelfAttention # CUDA flash-attn kernels (requires flash-attn)
+      |-- CrossAttention / FlashCrossAttention
+      `-- RotaryEmbedding    # from .RotaryEmbedding
+
+plus :class:`ParallelMHA` (tensor-parallel variant) and the ALiBi helper
+:func:`get_alibi_slopes`.
+
+What eScreen actually runs
+--------------------------
+``AttentionBlock`` constructs ``MHA`` with ``embed_dim = hidden_size`` (128
+distilled / 256 full), ``num_heads = 8``, ``num_heads_kv = num_heads // 1``,
+``rotary_emb_dim = head_dim``, ``rotary_emb_base = 1e6``, ``causal = True``,
+``qkv_proj_bias = False``, ``out_proj_bias = True`` and
+``use_flash_attn = False``.  That selects the pure-PyTorch
+:class:`SelfAttention` core (SDPA) and the fused ``Wqkv`` path, i.e. *none* of the
+flash-attn code in this module is executed.  The ``causal=True`` flag is what makes
+this block lower-triangular -- see the note in ``AttentionBlock``.
+
+Shapes: input ``[B, L, D]``, packed projection ``[B, L, 3H, D/H]``, attention
+scores ``[B, H, L, L]``, output ``[B, L, D]`` (``L = 512``, bfloat16).
+
+Adapted from the StripedHyena2 reference implementation (itself based on the
+flash-attention ``layers/rotary.py`` + Megatron-style ``MHA``).
+"""
+
 import torch
 import torch.nn as nn
 from .RotaryEmbedding import RotaryEmbedding
@@ -34,6 +67,9 @@ def get_dim_for_local_rank(dim: int, world_size: int, local_rank: int, multiple_
     """Get the dim for the local rank derived from splitting dim on world_size processes.
 
     The split may not be even across the world_size processes.
+    # The remainder is handed out one unit at a time (`multiple_of` granularity), so
+    # the first `mod` ranks get one extra unit -- this keeps the per-rank sizes
+    # summing exactly to `dim` even when `dim` is not divisible by `world_size`.
     """
     multiple = dim // multiple_of
     div = multiple // world_size
@@ -47,6 +83,31 @@ def get_dim_for_local_rank(dim: int, world_size: int, local_rank: int, multiple_
 
 # simple wrapper for flash-attn RoPE with linear scaling:
 class LinearlyScaledRotaryEmbedding(RotaryEmbedding):
+    """RoPE with linear position scaling (NTK-free "position interpolation").
+
+    An angle at position ``t`` is computed as if the position were
+    ``t / scaling_factor``, which compresses ``scaling_factor`` times more context
+    into the same angular range.  eScreen does not use it (it is only reachable via
+    ``AttentionBlock(use_interpolated_rotary_pos_emb=True)``, a branch that is dead
+    for other reasons too).
+
+    Parameters
+    ----------
+    dim : int
+        Width of the rotated subspace (the head dimension in eScreen).
+    scaling_factor : float, optional
+        Position divisor; 1.0 reproduces plain RoPE.
+    base : float, optional
+        RoPE frequency base (1e6 from ``AttentionBlock``).
+    interleaved : bool, optional
+        Channel pairing convention; False is GPT-NeoX style.
+    scale_base : float or None, optional
+        If given, enables XPos scaling.
+    pos_idx_in_fp32 : bool, optional
+        Build the position index in float32 (recommended; see the parent class).
+    device : torch.device, optional
+        Device for the frequency buffer.
+    """
     def __init__(
         self,
         dim: int,
@@ -57,6 +118,7 @@ class LinearlyScaledRotaryEmbedding(RotaryEmbedding):
         pos_idx_in_fp32=True,
         device=None,
     ):
+        """Store the scaling factor; the frequency tables are inherited unchanged."""
         super().__init__(
             dim=dim,
             base=base,
@@ -69,6 +131,29 @@ class LinearlyScaledRotaryEmbedding(RotaryEmbedding):
 
     # adpated from: https://github.com/Dao-AILab/flash-attention/blob/43ceab630bc6c27712428da5a33fc9cb5c369d91/flash_attn/layers/rotary.py#L368
     def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):
+        """Rebuild the cos/sin tables with positions divided by the scaling factor.
+
+        Parameters
+        ----------
+        seqlen : int
+            Number of positions to cache.
+        device : torch.device, optional
+            Device of the tables.
+        dtype : torch.dtype, optional
+            Storage dtype of the tables (matches the q/k dtype).
+
+        Returns
+        -------
+        None
+            Writes ``_cos_cached`` / ``_sin_cached`` (and the XPos variants).
+
+        Notes
+        -----
+        This is a copy of the parent method with the single extra line
+        ``t = t / self._linear_scaling_factor``; the cache-invalidation condition
+        and the float32 rationale are identical.  Keeping the copy means the parent
+        class stays bit-identical to upstream.
+        """
         # Reset the tables if the sequence length has changed,
         # if we're on a new device (possibly due to tracing for instance),
         # or if we're switching from inference mode to training
@@ -124,6 +209,32 @@ def swap_mha_rope(
     new_rope: torch.nn.Module = LinearlyScaledRotaryEmbedding,
     kwargs_new_rope: dict = None,
 ):
+    """Replace an existing ``MHA`` instance's RoPE module in place.
+
+    Parameters
+    ----------
+    mha : MHA
+        Module whose ``rotary_emb`` attribute is swapped.
+    new_rope : type, optional
+        Replacement class (default :class:`LinearlyScaledRotaryEmbedding`).
+    kwargs_new_rope : dict, optional
+        Extra constructor arguments for the new class (default
+        ``{"scaling_factor": 1.0}``).
+
+    Returns
+    -------
+    MHA
+        The same object, mutated.
+
+    Notes
+    -----
+    The old module's hyper-parameters are read back from the instance (not from the
+    config) so that the replacement is guaranteed to rotate the same subspace.  The
+    deletion-then-assignment is what makes PyTorch re-register the submodule; a
+    plain attribute assignment would leave the old module registered under the same
+    name only if it were an ``nn.Module`` attribute set via ``__setattr__`` -- which
+    it is, so the explicit ``del`` is belt-and-braces.
+    """
     # determine mha dtype and device:
     dtype = mha.Wq.weight.dtype if mha.cross_attn else mha.Wqkv.weight.dtype
     device = mha.Wq.weight.device if mha.cross_attn else mha.Wqkv.weight.device
@@ -155,6 +266,26 @@ def swap_mha_rope(
 
 # From https://github.com/ofirpress/attention_with_linear_biases/blob/4b92f28a005ead2567abe2359f633e73e08f3833/fairseq/models/transformer.py#L742
 def get_alibi_slopes(nheads):
+    """ALiBi attention slopes (Press et al.), one per head.
+
+    Parameters
+    ----------
+    nheads : int
+        Number of attention heads; need not be a power of two.
+
+    Returns
+    -------
+    list of float
+        Slopes in decreasing order of magnitude, so head 0 has the strongest
+        recency bias.
+
+    Notes
+    -----
+    For a power of two the slopes are ``2^(-8/n) ** i``; otherwise the largest power
+    of two ``n' <= n`` contributes its slopes and the remaining ``n - n'`` heads take
+    every second slope of a ``2n'`` table, which reproduces the published ALiBi
+    recipe.  eScreen does not use ALiBi (``use_alibi=False``).
+    """
     def get_slopes_power_of_2(nheads):
         start = 2 ** (-(2 ** -(math.log2(nheads) - 3)))
         ratio = start
@@ -196,6 +327,31 @@ class FlashSelfAttention(nn.Module):
         alibi_slopes=None,
         deterministic=False,
     ):
+        """Store the attention switches; the flash kernel is validated at call time.
+
+        Parameters
+        ----------
+        layer_number : int
+            Layer index (stored only; the kernels do not use it).
+        causal : bool, optional
+            Default mask direction.
+        softmax_scale : float or None, optional
+            ``None`` means the flash kernel uses ``1/sqrt(head_dim)``.
+        attention_dropout : float, optional
+            Dropout probability (0.0 in eScreen).
+        window_size : tuple, optional
+            ``(left, right)`` sliding window; ``(-1, -1)`` means unbounded.
+        alibi_slopes : torch.Tensor, optional
+            Registered as a non-persistent buffer when given.
+        deterministic : bool, optional
+            Use the deterministic (slower) backward kernel.
+
+        Notes
+        -----
+        The two asserts at the top fail at *construction* time when the flash-attn
+        extension could not be imported, which is why ``MHA`` only instantiates this
+        class when ``use_flash_attn=True``.
+        """
         super().__init__()
         assert local_flash_attn_varlen_qkvpacked_func is not None, "FlashAttention is not installed"
         assert local_flash_attn_qkvpacked_func is not None, "FlashAttention is not installed"
@@ -280,6 +436,7 @@ class FlashCrossAttention(nn.Module):
         window_size=(-1, -1),
         deterministic=False,
     ):
+        """Store the cross-attention switches (same fields as FlashSelfAttention)."""
         super().__init__()
         assert local_flash_attn_varlen_kvpacked_func is not None, "FlashAttention is not installed"
         assert local_flash_attn_kvpacked_func is not None, "FlashAttention is not installed"
@@ -369,6 +526,18 @@ class SelfAttention(nn.Module):
     """
 
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+        """SDPA-based attention core: the path eScreen actually executes.
+
+        Parameters
+        ----------
+        causal : bool, optional
+            Default causal masking (overridable per call).
+        softmax_scale : float or None, optional
+            Scale applied to ``QK^T`` before softmax; ``None`` means
+            ``1/sqrt(head_dim)``, which is what SDPA applies by default.
+        attention_dropout : float, optional
+            Dropout probability (0.0 in eScreen, so no dropout at all).
+        """
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
@@ -383,6 +552,12 @@ class SelfAttention(nn.Module):
             key_padding_mask: boolean mask to apply to the attention weights. True means to keep,
                 False means to mask out. (B, S)
         """
+        # The line below scales q by (softmax_scale * sqrt(d)).  SDPA already divides
+        # QK^T by sqrt(d) internally, so this pre-multiplication is exactly what turns
+        # the built-in 1/sqrt(d) into an arbitrary user-supplied softmax_scale; with
+        # the default (softmax_scale = 1/sqrt(d)) the factor telescopes to 1 and the
+        # line is a no-op.  Doing it here rather than in the matmul avoids a second
+        # pass over the scores.
         q, k, v = qkv.unbind(dim=2)  # each: (B, T, H, D)
         q = q.permute(0, 2, 1, 3)  # (B, H, T, D)
         k = k.permute(0, 2, 1, 3)
@@ -425,6 +600,11 @@ class CrossAttention(nn.Module):
     """
 
     def __init__(self, causal=False, softmax_scale=None, attention_dropout=0.0):
+        """Explicit (non-flash) cross-attention: manual softmax over ``QK^T``.
+
+        Used only when ``use_flash_attn=False`` *and* cross-attention is requested;
+        eScreen uses self-attention, so this class is not exercised.
+        """
         super().__init__()
         self.causal = causal
         self.softmax_scale = softmax_scale
@@ -474,6 +654,9 @@ class CrossAttention(nn.Module):
 
 class LinearResidual(nn.Linear):
     """Wrap nn.Linear to return the residual as well. For compatibility with FusedDense."""
+    # Returns (output, input) so that a caller can fuse the residual addition with
+    # the backward pass of the Linear; see the return_residual flag of MHA.  The
+    # tuple is why ParallelGatedMLP has grab_first_if_tuple().
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input), input
@@ -481,6 +664,10 @@ class LinearResidual(nn.Linear):
 
 def _update_kv_cache(kv, inference_params, layer_idx):
     """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
+    # The cache is allocated lazily on first use with the maximum shapes from the
+    # InferenceParams object, then written in place at the current offset.  The
+    # returned view stops at the current sequence end, so the attention core only
+    # sees valid keys.
     # Pre-allocate memory for key-values for inference.
     num_heads, head_dim = kv.shape[-2:]
     if layer_idx not in inference_params.key_value_memory_dict:
@@ -510,6 +697,10 @@ def _update_kv_cache(kv, inference_params, layer_idx):
 
 class MHA(nn.Module):
     """Multi-head self-attention and cross-attention"""
+    # Structure of forward(): one fused QKV projection (or separate Q and KV for
+    # cross-attention / GQA), optional depth-wise conv, optional RoPE, then the
+    # attention core, then the output projection.  The residual is *not* added here
+    # -- AttentionBlock adds it -- so this module is a pure mixing operator.
 
     def __init__(
         self,
@@ -543,6 +734,9 @@ class MHA(nn.Module):
             performance reason: for post-norm architecture, returning the input allows us
             to fuse the backward of nn.Linear with the residual connection.
         """
+        # Only the fused-QKV path (num_heads_kv == num_heads, no cross-attention)
+        # is used by eScreen; the GQA/cross-attention branches exist for the
+        # upstream model family.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.embed_dim = embed_dim
@@ -623,6 +817,22 @@ class MHA(nn.Module):
         self.out_proj = linear_cls(embed_dim, embed_dim, bias=out_proj_bias, **factory_kwargs)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
+        """Allocate an empty KV cache for inference.
+
+        Parameters
+        ----------
+        batch_size : int
+            Maximum batch size.
+        max_seqlen : int
+            Maximum sequence length to cache.
+        dtype : torch.dtype, optional
+            Cache dtype; defaults to the output projection's dtype.
+
+        Returns
+        -------
+        torch.Tensor
+            ``[batch_size, max_seqlen, 2, num_heads_kv, head_dim]``, uninitialised.
+        """
         dtype = self.out_proj.weight.dtype if dtype is None else dtype
         device = self.out_proj.weight.device
         return torch.empty(
@@ -637,6 +847,9 @@ class MHA(nn.Module):
 
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
+        # ``layer_idx`` must have been passed to the constructor: it is the key under
+        # which this layer's cache lives, so decoding with layer_idx=None fails the
+        # assert rather than silently sharing one cache between layers.
         assert not self.dwconv, "Generation does not support dwconv yet"
         assert self.layer_idx is not None, "Generation requires layer_idx in the constructor"
         return _update_kv_cache(kv, inference_params, self.layer_idx)
@@ -647,6 +860,10 @@ class MHA(nn.Module):
         q: (batch_size, seqlen_q, nheads, head_dim)
         kv: (batch_size, seqlen_k, 2, nheads_kv, head_dim)
         """
+        # Fused path for cached decoding: the flash kernel applies RoPE to the new
+        # q/k, appends them to the cache and attends in one launch.  Requires
+        # seqlen_offset > 0 (i.e. at least one token already cached) and a rotary
+        # width divisible by 16 -- both checked by the caller before branching here.
         assert inference_params is not None and inference_params.seqlen_offset > 0
         assert self.use_flash_attn
         if self.rotary_emb_dim > 0:
@@ -684,6 +901,9 @@ class MHA(nn.Module):
 
     def _update_kvcache_attention(self, q, kv, inference_params):
         """Write kv to inference_params, then do attention"""
+        # Either update the cache by hand and run the ordinary attention core (first
+        # step, no flash, or no kvcache kernel available), or let the flash kvcache
+        # kernel do the append + attention in one call.
         if inference_params.seqlen_offset == 0 or local_flash_attn_with_kvcache is None or not self.use_flash_attn:
             # TODO: this only uses seqlen_offset and not lengths_per_sample.
             kv = self._update_kv_cache(kv, inference_params)
@@ -738,6 +958,11 @@ class MHA(nn.Module):
             inference_params: for generation. Adapted from Megatron-LM (and Apex)
             https://github.com/NVIDIA/apex/blob/3ff1a10f72ec07067c4e44759442329804ac5162/apex/transformer/testing/standalone_transformer_lm.py#L470
         """
+        # Branch summary for the version eScreen runs (self-attention,
+        # num_heads_kv == num_heads): Wqkv -> optional dwconv -> RoPE -> SelfAttention
+        # -> out_proj.  The ``inference_params is None`` case is the only one taken
+        # during training and evaluation, and it is the branch whose attention core
+        # receives the constructor's causal=True.
         if cu_seqlens is not None:
             assert max_seqlen is not None
             assert key_padding_mask is None
@@ -851,6 +1076,11 @@ class MHA(nn.Module):
 
 class ParallelMHA(nn.Module):
     """Multi-head self-attention and cross-attention"""
+    # NOTE: unusable in this checkout.  The tensor-parallel layers are hard-set to
+    # ``FusedDense, ColumnParallelLinear, RowParallelLinear = None, None, None`` at
+    # the top of the module (the fused_dense package is not vendored), so
+    # ParallelMHA.__init__ always raises ImportError.  Nothing in eScreen
+    # instantiates it -- model parallelism is 1 everywhere.
 
     def __init__(
         self,
@@ -876,6 +1106,39 @@ class ParallelMHA(nn.Module):
         device=None,
         dtype=None,
     ) -> None:
+        """Set up the tensor-parallel projections.
+
+        Parameters
+        ----------
+        embed_dim : int
+            Full (unsharded) model width ``D``.
+        num_heads : int
+            Total number of heads across all ranks.
+        process_group : torch.distributed.ProcessGroup
+            Group over which QKV is column- and the output row-sharded.
+        num_heads_kv : int, optional
+            K/V heads for GQA; defaults to ``num_heads``.
+        qkv_proj_bias, out_proj_bias : bool, optional
+            Biases for the sharded projections.
+        dropout, softmax_scale, causal, layer_idx, rotary_emb_dim,
+        rotary_emb_base, rotary_emb_scale_base, rotary_emb_interleaved,
+        use_alibi, window_size : optional
+            Same meaning as in :class:`MHA`, applied per rank.
+        use_flash_attn : bool, optional
+            Selects the flash cores (required for ALiBi / sliding window).
+        checkpointing : bool, optional
+            Recompute the attention core in the backward pass.
+        sequence_parallel : bool, optional
+            Shard the sequence axis instead of the head axis.
+        device, dtype : optional
+            Passed to the sharded layers.
+
+        Notes
+        -----
+        ``multiple_of`` on the column-parallel layer keeps every rank's QKV shard a
+        multiple of ``head_dim * (num_heads/num_heads_kv + 2)``, i.e. each rank gets a
+        whole number of Q/K/V head groups.
+        """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.embed_dim = embed_dim
@@ -959,6 +1222,7 @@ class ParallelMHA(nn.Module):
         )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
+        """Allocate the per-rank KV cache: ``[B, L, 2, heads_kv_per_rank, head_dim]``."""
         dtype = self.out_proj.weight.dtype if dtype is None else dtype
         device = self.out_proj.weight.device
         return torch.empty(
@@ -973,6 +1237,8 @@ class ParallelMHA(nn.Module):
 
     def _update_kv_cache(self, kv, inference_params):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
+        # Same bookkeeping as MHA._update_kv_cache; only the head count differs
+        # (per-rank shard instead of the full head count).
         assert self.layer_idx is not None, "Generation requires layer_idx in the constructor"
         return _update_kv_cache(kv, inference_params, self.layer_idx)
 
@@ -982,6 +1248,9 @@ class ParallelMHA(nn.Module):
         q: (batch_size, seqlen_q, nheads, head_dim)
         kv: (batch_size, seqlen_k, 2, nheads_kv, head_dim)
         """
+        # Same fused decode path as MHA: RoPE + cache append + attention in one
+        # kernel, available only when tokens are already cached and the rotary width
+        # is a multiple of 16.
         assert inference_params is not None and inference_params.seqlen_offset > 0
         assert self.use_flash_attn
         if self.rotary_emb_dim > 0:
@@ -1019,6 +1288,8 @@ class ParallelMHA(nn.Module):
 
     def _update_kvcache_attention(self, q, kv, inference_params):
         """Write kv to inference_params, then do attention"""
+        # Cache write + attention, or the fused flash kvcache kernel when a cache
+        # already exists and flash-attn is in use.
         if inference_params.seqlen_offset == 0 or not self.use_flash_attn:
             # TODO: this only uses seqlen_offset and not lengths_per_sample.
             kv = self._update_kv_cache(kv, inference_params)
