@@ -56,6 +56,33 @@ class RMSNorm(torch.nn.Module):
        would scale every activation by ``sqrt(D)`` (about 11x at ``D = 128``).
     """
     def __init__(self, hidden_size,eps=1e-6,use_flash_rmsnorm=False):
+        """Create the gain parameter and optionally bind the flash kernel.
+
+        Parameters
+        ----------
+        hidden_size : int
+            Size ``D`` of the normalised (last) axis; 128 in the distilled
+            backbone, 256 in the full task configuration (§2.1).
+        eps : float, optional
+            Floor added to the root-mean-square, after the square root
+            (default ``1e-6``).
+        use_flash_rmsnorm : bool, optional
+            Eagerly import ``flash_attn.ops.rms_norm`` and store it as
+            ``self.rmsnorm_func`` (default False).  eScreen keeps this False, so no
+            flash-attn symbol is touched when the layer is built.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        * The gain is ones-initialised, so a freshly built layer is an exact RMS
+          normaliser: it cannot disturb the residual stream at step 0.
+        * ``self.scale`` is created in the default (float32) dtype; the whole block
+          is cast to bfloat16 afterwards in ``escreen/escreen.py``, which is what
+          keeps inference in bf16 without silently promoting activations here.
+        """
         # expected args: residual eps, hidden size, whether to use fast normalization
         super().__init__()
         self.eps, self.hidden_size = eps, hidden_size

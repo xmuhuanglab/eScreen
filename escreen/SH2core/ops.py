@@ -1,3 +1,50 @@
+"""Vendored StripedHyena2 fused-kernel layer: Triton RoPE kernel + CUDA attention bindings.
+
+What this module is
+-------------------
+This file is the low-level compute shim that the StripedHyena2 backbone vendors
+from the flash-attention project.  It contains
+
+* :func:`rotary_kernel` / :func:`apply_rotary` -- a Triton kernel and its host
+  launcher implementing rotary position embeddings;
+* thin wrappers around the compiled ``flash_attn_2_cuda`` extension
+  (``_flash_attn_forward``, ``_flash_attn_backward``, ...), registered as
+  ``torch.library`` custom ops with fake (meta) implementations so that
+  ``torch.compile`` can trace through them on PyTorch >= 2.4;
+* the ``torch.autograd.Function`` classes and their public ``local_flash_attn_*``
+  entry points, mirroring the upstream flash-attn API (packed QKV, packed KV,
+  variable length, KV-cache update).
+
+What eScreen actually runs
+--------------------------
+Only :func:`apply_rotary` is executed.  ``RotaryEmbedding`` imports it and calls it
+for every Q/K rotation in ``AttentionBlock``.  Everything else is dead in this
+project, by configuration:
+
+* ``use_flash_attn = False`` (``escreen/escreen.py`` -> ``get_block('Attention')``)
+  selects ``MHA.SelfAttention``, i.e. PyTorch SDPA.  None of the
+  ``_flash_attn_*`` / ``local_flash_attn_*`` kernels are called.
+* ``use_flashfft = False`` and ``use_flash_depthwise = False`` keep the Hyena
+  blocks on plain ``torch.fft`` / ``F.conv1d`` (see ``HyenaInferenceEngine``), so
+  no FFT-fusion kernel from this layer is used either.
+* ``use_flash_rmsnorm = False`` in ``RMSNorm``.
+
+Dependency note
+---------------
+Importing the module imports ``triton`` and ``flash_attn_2_cuda`` unconditionally,
+and :mod:`RotaryEmbedding` imports ``apply_rotary`` from here *without* a guard
+(unlike :mod:`MHA`, which wraps its own import of the ``local_flash_attn_*``
+symbols in ``try/except ImportError``).  As a consequence the whole ``SH2core``
+package -- including ``AttentionBlock`` -- can only be imported when flash-attn and
+triton are installed, even though no CUDA attention kernel ever runs.
+
+Shapes are written with ``B`` batch, ``L`` sequence, ``H`` heads and ``D`` head
+dimension; eScreen uses ``L = 512`` and ``D = 16`` (``D = 32`` at the full
+``d_model = 256``).
+
+Adapted from the flash-attention project (BSD-3) as vendored by StripedHyena2.
+"""
+
 import torch
 import triton
 import triton.language as tl
@@ -37,6 +84,70 @@ def rotary_kernel(
     CONJUGATE: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
+    """Rotate one (batch, head) slice of ``X`` into ``OUT``.
+
+    Parameters
+    ----------
+    OUT, X : tl.tensor
+        ``[B, L, H, D]`` buffers (or ``[total, H, D]`` in variable-length mode);
+        ``OUT`` may alias ``X`` when the caller rotates in place.
+    COS, SIN : tl.tensor
+        ``[seqlen_ro, rotary_dim/2]`` tables.
+    CU_SEQLENS : tl.tensor or None
+        ``[B + 1]`` int32 cumulative lengths (variable-length mode only).
+    SEQLEN_OFFSETS : int or tl.tensor
+        Position offset: a scalar during training, a ``[B]`` per-sample vector
+        during KV-cache decoding.
+    seqlen, rotary_dim, seqlen_ro : int
+        Runtime shape scalars.
+    stride_out_*, stride_x_* : int
+        Element strides of the two 4-D buffers.
+    BLOCK_K : tl.constexpr
+        Power-of-two span covering the rotary width.
+    IS_SEQLEN_OFFSETS_TENSOR, IS_VARLEN, INTERLEAVED, CONJUGATE : tl.constexpr
+        Layout and behaviour switches (see the comment block below).
+    BLOCK_M : tl.constexpr
+        Positions handled per program.
+
+    Returns
+    -------
+    None
+        The rotated values are stored into ``OUT``.
+
+    Notes
+    -----
+    Grid is ``(ceil(seqlen / BLOCK_M), batch, nheads)``.  Only the first
+    ``rotary_dim`` channels of each head are touched, and masked loads make
+    positions beyond the cos/sin table fall back to the identity rotation
+    (``cos=1, sin=0``) instead of reading out of bounds.
+    """
+
+    # Triton kernel: rotate one (batch, head) plane of `X` into `OUT`.
+    #
+    # Grid = (ceil(seqlen / BLOCK_M), batch, nheads); each program handles BLOCK_M
+    # positions of a single head.  BLOCK_K spans the rotary width, so a program only
+    # touches the first `rotary_dim` channels of a head and leaves the remaining
+    # (headdim - rotary_dim) channels untouched.
+    #
+    # Two channel layouts:
+    #   INTERLEAVED = False (what eScreen uses): GPT-NeoX halves.  x0 = X[..., :d/2],
+    #     x1 = X[..., d/2:], and the rotated pair is written back to the same halves.
+    #   INTERLEAVED = True: GPT-J adjacent pairs.  Loading odd channels directly is
+    #     slow, so the kernel loads X0 = X[0, 1, 2, ...] and X1 = X[1, 0, 3, 2, ...]
+    #     (rk_swap) and picks the even/odd result with a tl.where on the parity.
+    #
+    # CONJUGATE flips the sign of sin, i.e. applies the transpose rotation; the
+    # backward pass reuses this kernel instead of having a dedicated one.
+    #
+    # Positions are rm_cs = rm + SEQLEN_OFFSETS, where the offset is a scalar during
+    # training and a per-batch scalar loaded from a tensor during KV-cache decoding
+    # (IS_SEQLEN_OFFSETS_TENSOR).  cos/sin are read from [seqlen_ro, rotary_dim/2]
+    # tables with masked loads, so positions past the table fall back to cos=1,
+    # sin=0 -- the identity rotation -- instead of reading out of bounds.
+    #
+    # Documented with comments on purpose: a bare string literal inside a
+    # @triton.jit function is handed to Triton's own AST front-end, which does not
+    # reliably discard it.
     pid_m = tl.program_id(axis=0)
     pid_batch = tl.program_id(axis=1)
     pid_head = tl.program_id(axis=2)
@@ -144,6 +255,7 @@ def apply_rotary(
     conjugate=False,
 ) -> torch.Tensor:
     """
+    Rotate ``x`` in place (or into a fresh tensor) at the given positions.
     Arguments:
         x: (batch, seqlen, nheads, headdim) if cu_seqlens is None
             else (total_seqlen, nheads, headdim).
@@ -226,9 +338,46 @@ def apply_rotary(
 
 
 def maybe_contiguous(x):
+    """Return ``x`` if its last dimension is contiguous, else a contiguous copy.
+
+    Parameters
+    ----------
+    x : torch.Tensor or None
+        Tensor about to be handed to a flash-attn kernel.
+
+    Returns
+    -------
+    torch.Tensor or None
+        ``x`` itself, ``x.contiguous()``, or ``None`` unchanged.
+
+    Notes
+    -----
+    The CUDA kernels require ``stride(-1) == 1``.  Copying only when that fails
+    avoids a redundant copy for the common case of a freshly projected tensor.
+    """
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 def round_multiple(x, m):
+    """Round ``x`` up to the nearest multiple of ``m``.
+
+    Parameters
+    ----------
+    x : int
+        Value to round.
+    m : int
+        Granularity (128 is the attention tile size).
+
+    Returns
+    -------
+    int
+        ``ceil(x / m) * m``.
+
+    Notes
+    -----
+    Used to size the attention-probability buffer (``S_dmask``), which the kernel
+    writes with rows/columns padded to 128; the buffer is *not* trimmed back
+    afterwards, so callers must not assume it matches ``seqlen`` exactly.
+    """
     return (x + m - 1) // m * m
 
 # torch.compile() support is only enabled for pytorch >= 2.4
@@ -240,7 +389,44 @@ if torch.__version__ >= "2.4.0":
 else:
 
     def noop_custom_op_wrapper(name, fn=None, /, *, mutates_args, device_types=None, schema=None):
+        """Stand-in for ``torch.library.custom_op`` on PyTorch < 2.4.
+
+        Parameters
+        ----------
+        name : str
+            Operator schema name (ignored).
+        fn : callable, optional
+            Function to register; when omitted a decorator is returned.
+        mutates_args : tuple
+            Names of mutated arguments (ignored).
+        device_types, schema : optional
+            Registration hints (ignored).
+
+        Returns
+        -------
+        callable
+            The undecorated function, or a pass-through decorator.
+
+        Notes
+        -----
+        Lets the same module body load on older PyTorch, where custom-op
+        registration is not required: without it ``torch.compile`` simply cannot
+        trace these kernels, which only matters on the flash path that eScreen does
+        not use.
+        """
         def wrap(func):
+            """Return ``func`` unchanged (the decorator no-op).
+
+            Parameters
+            ----------
+            func : callable
+                Function the pass-through decorator is applied to.
+
+            Returns
+            -------
+            callable
+                ``func`` itself.
+            """
             return func
 
         if fn is None:
@@ -248,7 +434,35 @@ else:
         return fn
 
     def noop_register_fake_wrapper(op, fn=None, /, *, lib=None, _stacklevel=1):
+        """Stand-in for ``torch.library.register_fake`` on PyTorch < 2.4.
+
+        Parameters
+        ----------
+        op : Any
+            Operator the fake implementation would be attached to (ignored).
+        fn : callable, optional
+            Fake implementation; when omitted a decorator is returned.
+        lib, _stacklevel : optional
+            Registration hints (ignored).
+
+        Returns
+        -------
+        callable
+            The undecorated function, or a pass-through decorator.
+        """
         def wrap(func):
+            """Return ``func`` unchanged (the decorator no-op).
+
+            Parameters
+            ----------
+            func : callable
+                Function the pass-through decorator is applied to.
+
+            Returns
+            -------
+            callable
+                ``func`` itself.
+            """
             return func
 
         if fn is None:
@@ -273,7 +487,45 @@ def _flash_attn_forward(
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward pass of dense (non-varlen) flash attention.
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        ``[B, L, H, D]``; the last dimension is made contiguous here.
+    dropout_p : float
+        Dropout probability (0.0 at inference).
+    softmax_scale : float
+        Scale applied to ``QK^T`` before the softmax.
+    causal : bool
+        Lower-triangular mask, aligned to the bottom-right corner when
+        ``L_q != L_k``.
+    window_size_left, window_size_right : int
+        Sliding-window bounds in tokens; ``-1`` means unbounded.
+    softcap : float
+        Tanh soft-capping of the logits; ``0`` disables it.
+    alibi_slopes : torch.Tensor, optional
+        Per-head ALiBi slopes.
+    return_softmax : bool
+        Also return the probability matrix.
+
+    Returns
+    -------
+    tuple
+        ``(out, softmax_lse, S_dmask, rng_state)``: ``out`` ``[B, L, H, D]``,
+        ``softmax_lse`` ``[B, H, L]`` float32, ``S_dmask`` the probability matrix
+        (empty unless requested), ``rng_state`` ``[2]`` int64.
+
+    Notes
+    -----
+    The ``print`` a few lines below is leftover upstream debugging output and
+    fires on every call.  eScreen never reaches this op because it runs attention
+    with ``use_flash_attn=False``.
+    """
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    # Debug print kept from upstream: it prints the type of every argument on every
+    # call.  Harmless but noisy; only safe to remove together with a re-test of the
+    # flash path, which eScreen does not use.
     print(type(q),type(k),type(v),'None',
           type(alibi_slopes),type(dropout_p),type(softmax_scale),type(causal),type(window_size_left),type(window_size_right),
           type(softcap),type(return_softmax),'None')
@@ -309,6 +561,25 @@ def _flash_attn_forward_fake(
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Meta implementation of :func:`_flash_attn_forward` (shape inference only).
+
+    Parameters
+    ----------
+    Same as the real operator.
+
+    Returns
+    -------
+    tuple
+        ``(out, softmax_lse, S_dmask, rng_state)`` with the correct shapes and
+        dtypes but uninitialised contents.
+
+    Notes
+    -----
+    Registered so ``torch.compile`` / meta-device tracing can infer shapes without
+    a CUDA context.  The probability buffer is allocated only when
+    ``return_softmax`` is set, and then rounded up to multiples of 128 to mirror
+    the kernel's tiling.
+    """
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
     seqlen_k = k.shape[1]
@@ -365,6 +636,38 @@ def _flash_attn_varlen_forward(
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Forward pass of variable-length flash attention (packed batch).
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        ``[total_q, H, D]`` / ``[total_k, H, D]`` -- the batch is packed along the
+        sequence axis instead of being padded per sample.
+    cu_seqlens_q, cu_seqlens_k : torch.Tensor
+        ``[B + 1]`` int32 cumulative sequence lengths.
+    max_seqlen_q, max_seqlen_k : int
+        Longest sequence in the batch; sizes the kernel grid.
+    dropout_p, softmax_scale, causal, window_size_left, window_size_right,
+    softcap, alibi_slopes, return_softmax : as in the dense variant.
+    block_table : torch.Tensor, optional
+        Paged-KV block table (unused by eScreen).
+    leftpad_k : torch.Tensor, optional
+        Per-sample left padding of K/V.
+    seqused_k : torch.Tensor, optional
+        Number of valid K/V positions per sample.
+    zero_tensors : bool
+        Zero the output buffers before accumulating (deterministic debugging).
+
+    Returns
+    -------
+    tuple
+        ``(out, softmax_lse, S_dmask, rng_state)`` with ``out``
+        ``[total_q, H, D]`` and ``softmax_lse`` ``[H, total_q]``.
+
+    Notes
+    -----
+    The commented-out NaN check below the call is inert upstream debugging code.
+    """
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
         q,
@@ -416,6 +719,24 @@ def _flash_attn_varlen_forward_fake(
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Meta implementation of :func:`_flash_attn_varlen_forward`.
+
+    Parameters
+    ----------
+    Same as the real operator.
+
+    Returns
+    -------
+    tuple
+        ``(out, softmax_lse, p, rng_state)``: ``out`` ``[total_q, H, D]``,
+        ``softmax_lse`` ``[H, total_q]`` float32, ``p`` empty unless
+        ``return_softmax`` (then ``[B, H, max_q_rounded, max_k_rounded]``).
+
+    Notes
+    -----
+    ``total_q`` is read from ``q.shape`` rather than recomputed from
+    ``cu_seqlens``, which keeps the fake path cheap under tracing.
+    """
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     paged_kv = block_table is not None
     batch_size = cu_seqlens_q.numel() - 1
@@ -468,6 +789,37 @@ def _flash_attn_backward(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Backward pass of dense flash attention; writes dq/dk/dv in place.
+
+    Parameters
+    ----------
+    dout : torch.Tensor
+        ``[B, L, H, D]`` gradient w.r.t. the attention output.
+    q, k, v, out : torch.Tensor
+        Tensors saved by the forward pass.
+    softmax_lse : torch.Tensor
+        ``[B, H, L]`` log-sum-exp from the forward pass (the softmax denominator).
+    dq, dk, dv : torch.Tensor or None
+        Pre-allocated gradient buffers written in place (declared in
+        ``mutates_args``).
+    dropout_p, softmax_scale, causal, window_size_left, window_size_right,
+    softcap, alibi_slopes : as in the forward pass.
+    deterministic : bool
+        Use the deterministic (slower) backward kernel.
+    rng_state : torch.Tensor, optional
+        RNG state saved by the forward pass, needed to replay dropout.
+
+    Returns
+    -------
+    torch.Tensor
+        ``softmax_d``, the gradient of the softmax denominator.  The autograd
+        wrapper discards it; it exists for kernels that fuse the dq computation.
+
+    Notes
+    -----
+    The in-place contract is why the caller allocates ``dq/dk/dv`` itself and why
+    those buffers are declared in ``mutates_args`` rather than returned.
+    """
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
@@ -520,6 +872,18 @@ def _flash_attn_backward_fake(
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Meta implementation of :func:`_flash_attn_backward`.
+
+    Parameters
+    ----------
+    Same as the real operator; ``dq``/``dk``/``dv`` are allocated here when the
+    caller passes ``None``.
+
+    Returns
+    -------
+    torch.Tensor
+        ``softmax_d`` of shape ``[B, H, round_multiple(L, 128)]``, float32.
+    """
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     if dq is None:
         dq = torch.empty_like(q)
@@ -573,6 +937,29 @@ def _flash_attn_varlen_backward(
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
+    """Backward pass of variable-length flash attention (in-place gradients).
+
+    Parameters
+    ----------
+    Most parameters mirror :func:`_flash_attn_backward`, with
+    ``cu_seqlens_q``/``cu_seqlens_k`` (``[B + 1]`` int32) and
+    ``max_seqlen_q``/``max_seqlen_k`` describing the packed batch instead of
+    ``[B, L, ...]`` shapes.
+    rng_state : torch.Tensor, optional
+        RNG state from the forward pass.
+    zero_tensors : bool, optional
+        Zero the gradient buffers first.
+
+    Returns
+    -------
+    torch.Tensor
+        ``softmax_d``, which the autograd wrapper discards.
+
+    Notes
+    -----
+    The commented-out NaN check below the call is upstream debugging code and is
+    inert.
+    """
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
@@ -637,6 +1024,18 @@ def _flash_attn_varlen_backward_fake(
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
 ) -> torch.Tensor:
+    """Meta implementation of :func:`_flash_attn_varlen_backward`.
+
+    Parameters
+    ----------
+    Same as the real operator.
+
+    Returns
+    -------
+    torch.Tensor
+        ``softmax_d`` of shape ``[H, total_q + 128 * B]``, float32 -- the extra
+        ``128 * B`` slack is the kernel's per-sequence tile padding.
+    """
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
@@ -659,6 +1058,16 @@ else:
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
+    """Packed-QKV dense attention: self-attention with Q, K, V interleaved.
+
+    Wraps :func:`_flash_attn_forward` (or its variable-length twin) in a custom
+    autograd function, so the backward pass avoids concatenating the Q/K/V
+    gradients.  The head dimension is zero-padded to a multiple of 8 before the
+    kernel call and trimmed afterwards, because the CUDA kernel requires that
+    alignment.
+
+    Not used by eScreen: the attention block runs with ``use_flash_attn=False``.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -673,6 +1082,45 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
+        """Run the forward kernel and stash the tensors needed by backward.
+
+        Parameters
+        ----------
+        qkv : torch.Tensor
+            ``[B, L, 3, H, D]`` -- Q, K, V stacked along axis 2.
+        dropout_p : float
+            Dropout probability (0.0 at inference).
+        softmax_scale : float or None
+            Scale for ``QK^T``; ``None`` means ``D ** -0.5``.
+        causal : bool
+            Apply the causal mask.
+        window_size : tuple of int
+            ``(left, right)`` sliding window; ``(-1, -1)`` is unbounded.
+        softcap : float
+            Tanh logit soft-cap; ``0`` disables it.
+        alibi_slopes : torch.Tensor, optional
+            Per-head ALiBi slopes.
+        deterministic : bool
+            Use the deterministic backward kernel.
+        return_softmax : bool
+            Also return the probability matrix (only materialised when
+            ``dropout_p > 0``).
+        is_grad_enabled : bool
+            The caller's grad mode, passed explicitly because a custom
+            ``autograd.Function`` cannot observe it.
+
+        Returns
+        -------
+        out : torch.Tensor
+            ``[B, L, H, D]``.
+            Plus ``(softmax_lse, S_dmask)`` when ``return_softmax`` is set.
+
+        Notes
+        -----
+        ``.detach()`` on the inputs keeps the kernel call out of the autograd
+        graph; the graph is rebuilt in :meth:`backward`, and
+        ``ctx.save_for_backward`` is only populated when a gradient is needed.
+        """
         is_grad = is_grad_enabled and qkv.requires_grad
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -709,6 +1157,29 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        """Run the backward kernel and trim the gradients to the input layout.
+
+        Parameters
+        ----------
+        dout : torch.Tensor
+            Gradient w.r.t. the attention output (possibly head-dim padded).
+        *args
+            Ignored extra gradients (e.g. from ``return_softmax``).
+
+        Returns
+        -------
+        tuple
+            One gradient per forward argument; every parameter other than the
+            packed tensor(s) is non-differentiable and gets ``None``.  The number
+            of trailing ``None`` values must match the forward signature exactly,
+            or autograd raises.
+
+        Notes
+        -----
+        ``dout`` is re-padded to a multiple of 8 and the returned gradients are
+        trimmed back to the original head width, undoing the padding applied in
+        :meth:`forward`.
+        """
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
@@ -741,6 +1212,16 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
 
 
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
+    """Packed-QKV variable-length attention (packed batch, no padding).
+
+    Wraps :func:`_flash_attn_forward` (or its variable-length twin) in a custom
+    autograd function, so the backward pass avoids concatenating the Q/K/V
+    gradients.  The head dimension is zero-padded to a multiple of 8 before the
+    kernel call and trimmed afterwards, because the CUDA kernel requires that
+    alignment.
+
+    Not used by eScreen: the attention block runs with ``use_flash_attn=False``.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -757,6 +1238,46 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
+        """Run the forward kernel and stash the tensors needed by backward.
+
+        Parameters
+        ----------
+        qkv : torch.Tensor
+            ``[total, 3, H, D]``; ``cu_seqlens`` ``[B + 1]`` int32 and
+            ``max_seqlen`` describe the batch.
+        dropout_p : float
+            Dropout probability (0.0 at inference).
+        softmax_scale : float or None
+            Scale for ``QK^T``; ``None`` means ``D ** -0.5``.
+        causal : bool
+            Apply the causal mask.
+        window_size : tuple of int
+            ``(left, right)`` sliding window; ``(-1, -1)`` is unbounded.
+        softcap : float
+            Tanh logit soft-cap; ``0`` disables it.
+        alibi_slopes : torch.Tensor, optional
+            Per-head ALiBi slopes.
+        deterministic : bool
+            Use the deterministic backward kernel.
+        return_softmax : bool
+            Also return the probability matrix (only materialised when
+            ``dropout_p > 0``).
+        is_grad_enabled : bool
+            The caller's grad mode, passed explicitly because a custom
+            ``autograd.Function`` cannot observe it.
+
+        Returns
+        -------
+        out : torch.Tensor
+            ``[total, H, D]``.
+            Plus ``(softmax_lse, S_dmask)`` when ``return_softmax`` is set.
+
+        Notes
+        -----
+        ``.detach()`` on the inputs keeps the kernel call out of the autograd
+        graph; the graph is rebuilt in :meth:`backward`, and
+        ``ctx.save_for_backward`` is only populated when a gradient is needed.
+        """
         is_grad = is_grad_enabled and qkv.requires_grad
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -799,6 +1320,29 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        """Run the backward kernel and trim the gradients to the input layout.
+
+        Parameters
+        ----------
+        dout : torch.Tensor
+            Gradient w.r.t. the attention output (possibly head-dim padded).
+        *args
+            Ignored extra gradients (e.g. from ``return_softmax``).
+
+        Returns
+        -------
+        tuple
+            One gradient per forward argument; every parameter other than the
+            packed tensor(s) is non-differentiable and gets ``None``.  The number
+            of trailing ``None`` values must match the forward signature exactly,
+            or autograd raises.
+
+        Notes
+        -----
+        ``dout`` is re-padded to a multiple of 8 and the returned gradients are
+        trimmed back to the original head width, undoing the padding applied in
+        :meth:`forward`.
+        """
         q, k, v, out, softmax_lse, cu_seqlens, rng_state = ctx.saved_tensors
         qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
         dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
@@ -835,6 +1379,16 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
 
 
 class FlashAttnKVPackedFunc(torch.autograd.Function):
+    """Packed-KV dense attention, i.e. MQA/GQA-aware self- or cross-attention.
+
+    Wraps :func:`_flash_attn_forward` (or its variable-length twin) in a custom
+    autograd function, so the backward pass avoids concatenating the Q/K/V
+    gradients.  The head dimension is zero-padded to a multiple of 8 before the
+    kernel call and trimmed afterwards, because the CUDA kernel requires that
+    alignment.
+
+    Not used by eScreen: the attention block runs with ``use_flash_attn=False``.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -850,6 +1404,47 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
+        """Run the forward kernel and stash the tensors needed by backward.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            ``[B, L_q, H_q, D]``.
+        kv : torch.Tensor
+            ``[B, L_k, 2, H_kv, D]`` with ``H_q % H_kv == 0``.
+        dropout_p : float
+            Dropout probability (0.0 at inference).
+        softmax_scale : float or None
+            Scale for ``QK^T``; ``None`` means ``D ** -0.5``.
+        causal : bool
+            Apply the causal mask.
+        window_size : tuple of int
+            ``(left, right)`` sliding window; ``(-1, -1)`` is unbounded.
+        softcap : float
+            Tanh logit soft-cap; ``0`` disables it.
+        alibi_slopes : torch.Tensor, optional
+            Per-head ALiBi slopes.
+        deterministic : bool
+            Use the deterministic backward kernel.
+        return_softmax : bool
+            Also return the probability matrix (only materialised when
+            ``dropout_p > 0``).
+        is_grad_enabled : bool
+            The caller's grad mode, passed explicitly because a custom
+            ``autograd.Function`` cannot observe it.
+
+        Returns
+        -------
+        out : torch.Tensor
+            ``[B, L_q, H_q, D]``.
+            Plus ``(softmax_lse, S_dmask)`` when ``return_softmax`` is set.
+
+        Notes
+        -----
+        ``.detach()`` on the inputs keeps the kernel call out of the autograd
+        graph; the graph is rebuilt in :meth:`backward`, and
+        ``ctx.save_for_backward`` is only populated when a gradient is needed.
+        """
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, kv])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -886,6 +1481,29 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        """Run the backward kernel and trim the gradients to the input layout.
+
+        Parameters
+        ----------
+        dout : torch.Tensor
+            Gradient w.r.t. the attention output (possibly head-dim padded).
+        *args
+            Ignored extra gradients (e.g. from ``return_softmax``).
+
+        Returns
+        -------
+        tuple
+            One gradient per forward argument; every parameter other than the
+            packed tensor(s) is non-differentiable and gets ``None``.  The number
+            of trailing ``None`` values must match the forward signature exactly,
+            or autograd raises.
+
+        Notes
+        -----
+        ``dout`` is re-padded to a multiple of 8 and the returned gradients are
+        trimmed back to the original head width, undoing the padding applied in
+        :meth:`forward`.
+        """
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
@@ -920,6 +1538,16 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
 
 
 class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
+    """Packed-KV variable-length attention (MQA/GQA over a packed batch).
+
+    Wraps :func:`_flash_attn_forward` (or its variable-length twin) in a custom
+    autograd function, so the backward pass avoids concatenating the Q/K/V
+    gradients.  The head dimension is zero-padded to a multiple of 8 before the
+    kernel call and trimmed afterwards, because the CUDA kernel requires that
+    alignment.
+
+    Not used by eScreen: the attention block runs with ``use_flash_attn=False``.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -939,6 +1567,48 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
+        """Run the forward kernel and stash the tensors needed by backward.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            ``[total_q, H_q, D]``.
+        kv : torch.Tensor
+            ``[total_k, 2, H_kv, D]``; two ``cu_seqlens`` arrays and two
+            ``max_seqlen`` values describe the two packed batches.
+        dropout_p : float
+            Dropout probability (0.0 at inference).
+        softmax_scale : float or None
+            Scale for ``QK^T``; ``None`` means ``D ** -0.5``.
+        causal : bool
+            Apply the causal mask.
+        window_size : tuple of int
+            ``(left, right)`` sliding window; ``(-1, -1)`` is unbounded.
+        softcap : float
+            Tanh logit soft-cap; ``0`` disables it.
+        alibi_slopes : torch.Tensor, optional
+            Per-head ALiBi slopes.
+        deterministic : bool
+            Use the deterministic backward kernel.
+        return_softmax : bool
+            Also return the probability matrix (only materialised when
+            ``dropout_p > 0``).
+        is_grad_enabled : bool
+            The caller's grad mode, passed explicitly because a custom
+            ``autograd.Function`` cannot observe it.
+
+        Returns
+        -------
+        out : torch.Tensor
+            ``[total_q, H_q, D]``.
+            Plus ``(softmax_lse, S_dmask)`` when ``return_softmax`` is set.
+
+        Notes
+        -----
+        ``.detach()`` on the inputs keeps the kernel call out of the autograd
+        graph; the graph is rebuilt in :meth:`backward`, and
+        ``ctx.save_for_backward`` is only populated when a gradient is needed.
+        """
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, kv])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -982,6 +1652,29 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        """Run the backward kernel and trim the gradients to the input layout.
+
+        Parameters
+        ----------
+        dout : torch.Tensor
+            Gradient w.r.t. the attention output (possibly head-dim padded).
+        *args
+            Ignored extra gradients (e.g. from ``return_softmax``).
+
+        Returns
+        -------
+        tuple
+            One gradient per forward argument; every parameter other than the
+            packed tensor(s) is non-differentiable and gets ``None``.  The number
+            of trailing ``None`` values must match the forward signature exactly,
+            or autograd raises.
+
+        Notes
+        -----
+        ``dout`` is re-padded to a multiple of 8 and the returned gradients are
+        trimmed back to the original head width, undoing the padding applied in
+        :meth:`forward`.
+        """
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq = torch.empty_like(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
@@ -1036,6 +1729,16 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
 
 
 class FlashAttnFunc(torch.autograd.Function):
+    """Dense attention with separate Q, K, V tensors (most general dense form).
+
+    Wraps :func:`_flash_attn_forward` (or its variable-length twin) in a custom
+    autograd function, so the backward pass avoids concatenating the Q/K/V
+    gradients.  The head dimension is zero-padded to a multiple of 8 before the
+    kernel call and trimmed afterwards, because the CUDA kernel requires that
+    alignment.
+
+    Not used by eScreen: the attention block runs with ``use_flash_attn=False``.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -1052,6 +1755,47 @@ class FlashAttnFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
+        """Run the forward kernel and stash the tensors needed by backward.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            ``[B, L_q, H_q, D]``.
+        k, v : torch.Tensor
+            ``[B, L_k, H_kv, D]`` with ``H_q % H_kv == 0``.
+        dropout_p : float
+            Dropout probability (0.0 at inference).
+        softmax_scale : float or None
+            Scale for ``QK^T``; ``None`` means ``D ** -0.5``.
+        causal : bool
+            Apply the causal mask.
+        window_size : tuple of int
+            ``(left, right)`` sliding window; ``(-1, -1)`` is unbounded.
+        softcap : float
+            Tanh logit soft-cap; ``0`` disables it.
+        alibi_slopes : torch.Tensor, optional
+            Per-head ALiBi slopes.
+        deterministic : bool
+            Use the deterministic backward kernel.
+        return_softmax : bool
+            Also return the probability matrix (only materialised when
+            ``dropout_p > 0``).
+        is_grad_enabled : bool
+            The caller's grad mode, passed explicitly because a custom
+            ``autograd.Function`` cannot observe it.
+
+        Returns
+        -------
+        out : torch.Tensor
+            ``[B, L_q, H_q, D]``.
+            Plus ``(softmax_lse, S_dmask)`` when ``return_softmax`` is set.
+
+        Notes
+        -----
+        ``.detach()`` on the inputs keeps the kernel call out of the autograd
+        graph; the graph is rebuilt in :meth:`backward`, and
+        ``ctx.save_for_backward`` is only populated when a gradient is needed.
+        """
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -1087,6 +1831,29 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        """Run the backward kernel and trim the gradients to the input layout.
+
+        Parameters
+        ----------
+        dout : torch.Tensor
+            Gradient w.r.t. the attention output (possibly head-dim padded).
+        *args
+            Ignored extra gradients (e.g. from ``return_softmax``).
+
+        Returns
+        -------
+        tuple
+            One gradient per forward argument; every parameter other than the
+            packed tensor(s) is non-differentiable and gets ``None``.  The number
+            of trailing ``None`` values must match the forward signature exactly,
+            or autograd raises.
+
+        Notes
+        -----
+        ``dout`` is re-padded to a multiple of 8 and the returned gradients are
+        trimmed back to the original head width, undoing the padding applied in
+        :meth:`forward`.
+        """
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         head_size_og = dout.size(3)
@@ -1120,6 +1887,16 @@ class FlashAttnFunc(torch.autograd.Function):
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
+    """Variable-length attention with separate Q, K, V tensors.
+
+    Wraps :func:`_flash_attn_forward` (or its variable-length twin) in a custom
+    autograd function, so the backward pass avoids concatenating the Q/K/V
+    gradients.  The head dimension is zero-padded to a multiple of 8 before the
+    kernel call and trimmed afterwards, because the CUDA kernel requires that
+    alignment.
+
+    Not used by eScreen: the attention block runs with ``use_flash_attn=False``.
+    """
     @staticmethod
     def forward(
         ctx,
@@ -1141,6 +1918,49 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_table,
         is_grad_enabled,
     ):
+        """Run the forward kernel and stash the tensors needed by backward.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            ``[total_q, H_q, D]``.
+        k, v : torch.Tensor
+            ``[total_k, H_kv, D]``; ``cu_seqlens_q/k`` and
+            ``max_seqlen_q/k`` describe the batches and ``block_table`` enables
+            paged KV.
+        dropout_p : float
+            Dropout probability (0.0 at inference).
+        softmax_scale : float or None
+            Scale for ``QK^T``; ``None`` means ``D ** -0.5``.
+        causal : bool
+            Apply the causal mask.
+        window_size : tuple of int
+            ``(left, right)`` sliding window; ``(-1, -1)`` is unbounded.
+        softcap : float
+            Tanh logit soft-cap; ``0`` disables it.
+        alibi_slopes : torch.Tensor, optional
+            Per-head ALiBi slopes.
+        deterministic : bool
+            Use the deterministic backward kernel.
+        return_softmax : bool
+            Also return the probability matrix (only materialised when
+            ``dropout_p > 0``).
+        is_grad_enabled : bool
+            The caller's grad mode, passed explicitly because a custom
+            ``autograd.Function`` cannot observe it.
+
+        Returns
+        -------
+        out : torch.Tensor
+            ``[total_q, H_q, D]``.
+            Plus ``(softmax_lse, S_dmask)`` when ``return_softmax`` is set.
+
+        Notes
+        -----
+        ``.detach()`` on the inputs keeps the kernel call out of the autograd
+        graph; the graph is rebuilt in :meth:`backward`, and
+        ``ctx.save_for_backward`` is only populated when a gradient is needed.
+        """
         is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
@@ -1184,6 +2004,29 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        """Run the backward kernel and trim the gradients to the input layout.
+
+        Parameters
+        ----------
+        dout : torch.Tensor
+            Gradient w.r.t. the attention output (possibly head-dim padded).
+        *args
+            Ignored extra gradients (e.g. from ``return_softmax``).
+
+        Returns
+        -------
+        tuple
+            One gradient per forward argument; every parameter other than the
+            packed tensor(s) is non-differentiable and gets ``None``.  The number
+            of trailing ``None`` values must match the forward signature exactly,
+            or autograd raises.
+
+        Notes
+        -----
+        ``dout`` is re-padded to a multiple of 8 and the returned gradients are
+        trimmed back to the original head width, undoing the padding applied in
+        :meth:`forward`.
+        """
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         head_size_og = dout.size(2)

@@ -287,6 +287,19 @@ def get_alibi_slopes(nheads):
     recipe.  eScreen does not use ALiBi (``use_alibi=False``).
     """
     def get_slopes_power_of_2(nheads):
+        """Geometric slope sequence for a power-of-two head count.
+
+        Parameters
+        ----------
+        nheads : int
+            Power-of-two number of heads.
+
+        Returns
+        -------
+        list of float
+            ``start * start**i`` for ``i = 0 .. nheads-1`` with
+            ``start = 2**(-8/nheads)``, i.e. the published ALiBi slopes.
+        """
         start = 2 ** (-(2 ** -(math.log2(nheads) - 3)))
         ratio = start
         return [start * ratio**i for i in range(nheads)]
@@ -659,6 +672,20 @@ class LinearResidual(nn.Linear):
     # tuple is why ParallelGatedMLP has grab_first_if_tuple().
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Return ``(Linear(input), input)``.
+
+        Parameters
+        ----------
+        input : torch.Tensor
+            ``[..., in_features]``.
+
+        Returns
+        -------
+        tuple
+            ``(output, input)`` -- the second element is the residual, passed
+            through untouched so the caller can add it (or fuse the addition with
+            the backward pass).
+        """
         return super().forward(input), input
 
 

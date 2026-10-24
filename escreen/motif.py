@@ -503,7 +503,29 @@ def load_pwm_from_meme_c1(file_path, max_length=29, norm='minmax'):
     """
 
     
-    def logit_func(x, a, b):return 1 / (1 + np.exp(-(a * x + b)))
+    def logit_func(x, a, b):
+        """Logistic curve fitted to the PWM score CDF.
+
+        Used by the ``'log'`` normalisation branch to turn the empirical score
+        distribution into a calibrated presence probability.  ``a`` rescales the
+        motif score and ``b`` shifts it; both are fitted, then ``a`` is folded
+        back into the matrix and ``b`` is returned as the per-motif bias.
+
+        Parameters
+        ----------
+        x : array-like
+            Score support produced by :func:`scoreDist`.
+        a : float
+            Fitted scale.
+        b : float
+            Fitted offset.
+
+        Returns
+        -------
+        array-like
+            ``sigmoid(a * x + b)``.
+        """
+        return 1 / (1 + np.exp(-(a * x + b)))
     
     with open(file_path, "r") as f:lines = f.readlines()
 

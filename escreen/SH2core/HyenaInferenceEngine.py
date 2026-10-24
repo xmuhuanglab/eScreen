@@ -173,6 +173,9 @@ def complex_matmul(a, b, device='cpu'):
     allocated real/imag pair, so the function is not autograd-friendly for complex
     leaves but is safe for the convolution use here.
     """
+    # The original one-line summary is retained verbatim on the next line; it is now
+    # a no-op string expression, and the NumPy-style docstring above is what Python
+    # exposes as this function's __doc__.
     """Multiplies two complex-valued tensors."""
     scalar_matmul = partial(torch.einsum, "ab..., cb... -> ac...")
 

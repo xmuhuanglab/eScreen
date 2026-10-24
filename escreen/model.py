@@ -163,15 +163,15 @@ class eSCREEN_backbone(nn.Module):
             # remains interpretable as the binding evidence of one known TF
             # motif; only the following linear projection is trained.
             #
-            # NOTE (possible bug): both kernels are read from ``kernel_fwd``
-            # below, so the reverse-complement strand is never actually loaded
-            # and ``kernel_rev`` silently duplicates the forward PWMs.  With the
-            # current code the 1,274 channels are therefore 637 forward motifs
-            # twice, not 637 forward + 637 reverse-complement as documented in
-            # Section 2.3.6.  Left unchanged here because this task only adds
-            # documentation; the fix is ``kwargs.get('kernel_rev')``.
+            # Both strand tensors are supplied by the caller: ``kernel_fwd``
+            # holds the forward PWMs and ``kernel_rev`` their reverse
+            # complements, each of shape ``[num_motifs, 4, kernel_size]``.
+            # Concatenating along dim 0 pairs motif ``i`` on the forward strand
+            # with channel ``i + num_motifs`` on the reverse strand, so a single
+            # motif always occupies a fixed pair of channels and downstream motif
+            # attribution can map a channel index back to (motif, strand).
             kernel_fwd = kwargs.get('kernel_fwd')
-            kernel_rev = kwargs.get('kernel_fwd')
+            kernel_rev = kwargs.get('kernel_rev')
             kernel_size = kernel_fwd.shape[-1]
             # compute the deterministic padding: padding = (kernel_size - 1) // 2
             # (recorded for reference only -- the conv below uses 'same' padding)
@@ -1079,6 +1079,24 @@ class eScreen_vX(nn.Module):
             raise ValueError(f"Unknown sampler: {sampler!r}")
 
         def _make_booster():
+            """Build the class-balanced sampler, or None when sampling is off.
+
+            Chooses the grouping variable for the sampler in priority order:
+
+            1. ``train_data['_boost_labels']`` if present -- an explicit override,
+               typically the binary functional/non-functional label;
+            2. ``train_data['label']`` when ``sampler`` is one of the
+               ``'label*'`` modes;
+            3. ``train_data['weight']`` if present -- lets callers up-weight by a
+               continuous score instead of a class;
+            4. ``train_data['label']`` as the fallback.
+
+            Returns
+            -------
+            utils.boost_sampler or None
+                ``None`` when ``use_boost`` is false, in which case the training
+                loop falls back to shuffled sampling with wrap-around padding.
+            """
             if not use_boost:
                 return None
             if '_boost_labels' in train_data:

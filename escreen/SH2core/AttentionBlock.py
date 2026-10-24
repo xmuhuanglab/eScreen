@@ -126,6 +126,51 @@ class AttentionBlock(nn.Module):
         # MLP parameters (passed through to ParallelGatedMLP)
         **kwargs
     ) -> None:
+        """Assemble the two norms, the attention sub-layer and the MLP sub-layer.
+
+        Parameters
+        ----------
+        hidden_size : int
+            Model width ``D``.
+        num_attention_heads : int
+            Head count ``H``; ``D % H == 0`` is asserted by ``MHA``.
+        layer_idx : int
+            Block index (3 in eScreen); forwarded to ``MHA`` and the MLP.
+        use_rms_norm : bool, optional
+            Unused -- the norms are always ``RMSNorm`` (kept for config
+            compatibility).
+        proj_groups : int, optional
+            GQA factor: ``num_heads_kv = num_attention_heads // proj_groups``
+            (1 in eScreen, i.e. plain MHA).
+        attn_block_dtype, mlp_dtype : torch.dtype, optional
+            dtypes applied to the two sub-modules (bfloat16).
+        qkv_proj_bias, mha_out_proj_bias : bool, optional
+            Biases of the fused QKV and output projections.
+        use_flash_attn : bool, optional
+            Select the flash-attn cores instead of PyTorch SDPA (False in eScreen).
+        rotary_emb_base : float, optional
+            RoPE base (``1e6``).
+        use_interpolated_rotary_pos_emb, rotary_emb_scaling_factor : optional
+            Linearly scaled RoPE; the branch calls ``swap_mha_rope``, which this
+            module does not import (see the note at the call site).
+        smeared_gqa : bool, optional
+            Force ``num_heads_kv = num_heads`` after construction; only consistent
+            with ``proj_groups == 1``.
+        **kwargs
+            The five MLP hyper-parameters, read with ``.get()``.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        * ``MHA`` is constructed with ``causal=True``: the attention mask of this
+          block is lower-triangular (see the comment at that argument).
+        * The MLP kwargs are read with ``.get()``, so a missing key becomes
+          ``None`` rather than the constructor's default -- ``escreen/escreen.py``
+          always passes all five.
+        """
         super().__init__()
         
         # store the basic parameters

@@ -107,6 +107,56 @@ class ParallelGatedConvBlock(nn.Module):
         *args,   # positional arguments not listed above
         **kwargs # keyword arguments not listed above
     ) -> None:
+        """Build the norms, the Hyena filter, the projections and the MLP.
+
+        Parameters
+        ----------
+        hidden_size : int
+            Model width ``D``.
+        layer_idx : int
+            Block index (0..2 for the three Hyena blocks).
+        qkv_proj_bias : bool
+            Bias of the input ``Linear(D, 3D)`` (False in eScreen).
+        hyena_out_proj_bias : bool
+            Bias of the output ``Linear(D, D)`` (True in eScreen).
+        hyena_filter_groups : int or None, optional
+            Number of long-filter systems; ``None`` means one per channel, i.e.
+            ``hidden_size`` (eScreen passes 128 explicitly).
+        fir_inner_filter_length : int or None, optional
+            Length of the explicit long filter; ``None`` selects the implicit modal
+            parameterisation (this is the only difference between HyenaSE/HyenaMR
+            and HyenaLI).
+        low_mem_mode : bool, optional
+            Stored and never read by this class (only honoured inside
+            ``HyenaInferenceEngine.parallel_iir``, which eScreen never reaches).
+        hyena_block_dtype : torch.dtype, optional
+            dtype of the norms, filter and projections (bfloat16).
+        mlp_dtype : torch.dtype, optional
+            dtype of the gated MLP (bfloat16).
+        use_fp8_input_projections : bool, optional
+            Enable the FP8 sequence padding in :meth:`pad_to_multiple` (False in
+            eScreen, where that helper is an identity).
+        compile : bool, optional
+            Wrap the two norm/projection helpers in ``torch.compile`` (False in
+            eScreen; the helpers are bound directly instead).
+        *args, **kwargs
+            Hyena and MLP hyper-parameters, read from ``**kwargs`` with ``.get()``.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        * ``self.hyena_filter_groups`` defaults to ``hidden_size``, and
+          ``HyenaCascade`` asserts that ``hidden_size % num_filters == 0`` -- so a
+          value that does not divide ``D`` fails at construction, not at run time.
+        * ``compile=False`` means ``proj_norm_fn``/``res_mlp_norm_fn`` are plain
+          bound methods, i.e. the forward path has no compiled wrapper.
+        * ``**kwargs.get(...)`` returns ``None`` for absent keys; that is *not*
+          equivalent to "keep the default" for the arithmetic parameters, which is
+          why ``escreen/escreen.py`` passes every one of them explicitly.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         self.low_mem_mode = low_mem_mode
@@ -200,6 +250,9 @@ class ParallelGatedConvBlock(nn.Module):
         to be a multiple of 16; instead of padding at the batch level the helper
         pads the sequence axis and :meth:`proj_norm` trims the result back.
         """
+        # The original one-line summary is retained verbatim on the next line; it is
+        # now a no-op string expression, and the NumPy-style docstring above is what
+        # Python exposes as this function's __doc__.
         """Pad input tensor to multiple of 16 only when FP8 is enabled"""
         # The moment this flag is False (the eScreen case) this method is an
         # identity, so L stays 512 and the trim in proj_norm is a no-op.

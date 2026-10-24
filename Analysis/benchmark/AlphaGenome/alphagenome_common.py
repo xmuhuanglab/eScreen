@@ -8,6 +8,59 @@ string perturbation utilities / evaluation metrics.
 Source:
   - benchmark/AlphaGenome_20260527.0.ipynb
   - benchmark/AlphaGenome_perturbation_FACS.ipynb
+
+What this module implements
+---------------------------
+The AlphaGenome arm of the model benchmarking described in Supplementary
+Methods §6.2.2, together with the AlphaGenome half of the FACS
+readout-specific evaluation in Supplementary Methods §5.5.
+
+AlphaGenome is *not* reimplemented here. The model is DeepMind's released
+package (``alphagenome``, imported below) and inference runs against their
+hosted API, so this repository only wraps it: it builds the three input
+sequences per CRE, fires them at the API, and stores the returned tracks. No
+AlphaGenome weights are distributed with this repo — Supplementary Methods
+§6.2.2 states that embedding-based and fine-tuning experiments were excluded
+for licensing reasons, and that only in silico perturbation was run.
+
+Two perturbation strategies are produced for every CRE (both from
+Supplementary Methods §6.2.2):
+
+``MASK``
+    The 512 bp window at the centre of the 1 Mb input is replaced with ``N``
+    ("N-masking perturbation"). Implemented by
+    :func:`prepare_sequences_fast` / :func:`mask_in_window`.
+``SHUFFLE``
+    The same 512 bp window is shuffled in place ("Sequence shuffling
+    perturbation"). Implemented by :func:`prepare_sequences_fast` /
+    :func:`shuffle_in_window`.
+
+The score actually consumed by the downstream evaluation scripts is
+``sum(WT - ALT)`` accumulated over all output bins of the CAGE head; see
+``analyze_facs_scores.py`` and ``evaluate_escreen_scores.py``.
+
+Coordinate conventions used throughout
+--------------------------------------
+Everything is 0-based, half-open (``[start, end)``) on hg38, matching
+:mod:`pyfaidx` slicing. The model input is a 1,048,576 bp window centred on the
+CRE summit; the perturbed window is the central 512 bp,
+``[524,032, 524,544)`` in window-local coordinates (see the constants below).
+
+Expected on disk
+----------------
+``data/hg38.fa``
+    hg38 reference genome indexed for :mod:`pyfaidx` (i.e. ``hg38.fa.fai``
+    must sit next to it). Only chr1-22, chrX and chrY are loaded. The path is
+    a hard-coded default; adjust before rerunning on another machine.
+
+Nothing else is read from disk. AlphaGenome runs behind the hosted API, so
+there is no local checkpoint; the API keys are hard-coded (see the note above
+:data:`API_KEY_1`).
+
+External dependencies not vendored in this repository
+-----------------------------------------------------
+``alphagenome`` (DeepMind), ``pyfaidx``, ``h5py``, ``scikit-learn``,
+``scipy`` and ``matplotlib``.
 """
 from alphagenome import colab_utils
 from alphagenome.data import gene_annotation
@@ -40,13 +93,35 @@ warnings.filterwarnings('ignore')
 
 
 # ── AlphaGenome API keys + model creation ────────────────────────
+# Hard-coded credentials for the hosted AlphaGenome API. Three separate keys
+# are used so that the WT / MASK / SHUFFLE requests of one batch can run
+# concurrently without sharing a per-key rate limit (see
+# :func:`process_batch_parallel`). These are research credentials committed by
+# the authors; treat them as secrets and replace with your own keys (or an
+# environment variable) before rerunning.
 API_KEY_1 = 'AIzaSyCqc-MYn0DnNcszFh8AjISkgHiiZk8wAUM'
 API_KEY_2 = 'AIzaSyC6jslFT4qt9Tbo0L9Ote7m60U__pP68r8'
 API_KEY_3 = 'AIzaSyC8xemKYuNnzX0nOnG5dpf6e8B_EMeT_Rc'
 
 
 def create_models():
-    """Create three models for parallel WT / MASK / SHUFFLE prediction."""
+    """Create three models for parallel WT / MASK / SHUFFLE prediction.
+
+    Each returned client is bound to its own API key so that the three
+    concurrent requests issued per batch do not contend for one key's quota.
+
+    Returns
+    -------
+    tuple of alphagenome.models.dna_client.DnaClient
+        ``(model1, model2, model3)``, backed by :data:`API_KEY_1`,
+        :data:`API_KEY_2` and :data:`API_KEY_3` respectively.
+
+    Notes
+    -----
+    Creating a client performs no inference; models are thin remote handles,
+    not local networks. Keep the same three objects alive for the whole run
+    (the runner scripts create them once in ``__main__`` and pass them down).
+    """
     model1 = dna_client.create(API_KEY_1)
     model2 = dna_client.create(API_KEY_2)
     model3 = dna_client.create(API_KEY_3)
@@ -55,12 +130,42 @@ def create_models():
 
 # ── Reference genome ─────────────────────────────────────────────
 def load_genome(fasta_path='data/hg38.fa'):
+    """Open an indexed hg38 FASTA and tabulate the lengths of the canonical chromosomes.
+
+    Parameters
+    ----------
+    fasta_path : str, optional
+        Path to the hg38 FASTA. Must already have a ``.fai`` index (pyfaidx
+        builds one on first access if the file is writable). Hard-coded
+        default ``data/hg38.fa``; adjust before rerunning elsewhere.
+
+    Returns
+    -------
+    hg38 : pyfaidx.Fasta
+        Random-access genome object; ``hg38[chrom][start:end].seq`` returns the
+        sequence of a 0-based, half-open interval.
+    chrom_len : dict of str to int
+        Chromosome length in bp for chr1-22, chrX and chrY — deliberately not
+        "all contigs", because the CRE tables only reference these. Used to
+        clip windows that hang off the chromosome end before padding with N.
+
+    Notes
+    -----
+    Loading the full index costs a few seconds; the object is then shared by
+    all batches (pyfaidx keeps an open file handle, so do not pickle it).
+    """
     hg38 = Fasta(fasta_path)
     chrom_len = {c: len(hg38[c]) for c in [f'chr{i}' for i in range(1, 23)] + ['chrX', 'chrY']}
     return hg38, chrom_len
 
 
 # ── Ontology term mapping ────────────────────────────────────────
+# AlphaGenome addresses cell types by Experimental Factor Ontology / Cell
+# Ontology accession rather than by free-text name, so every cell line in the
+# benchmark is mapped here once. WTC11 is the iPSC line used for the hPSC
+# experiments and is deliberately aliased to the same CL term as hPSC
+# (CL:0000047), which mirrors the P0_RELABEL = {'WTC11': 'hPSC'} convention
+# used by the other benchmark scripts.
 ONTOLOGY_TERM = {
     'K562': 'EFO:0002067',
     'HepG2': 'EFO:0001187',
@@ -72,6 +177,33 @@ ONTOLOGY_TERM = {
 
 
 def check_ontology(cell_lines):
+    """Fail fast if a CRE table contains a cell line with no ontology mapping.
+
+    Parameters
+    ----------
+    cell_lines : iterable of str
+        Cell-line labels as they appear in the input table (e.g. the unique
+        values of ``cre_df['cell_line']``).
+
+    Returns
+    -------
+    None
+        The function only validates and prints; the mapping itself lives in
+        :data:`ONTOLOGY_TERM`.
+
+    Raises
+    ------
+    ValueError
+        If any label is missing from :data:`ONTOLOGY_TERM`. Raising here is
+        preferable to a ``KeyError`` deep inside a batch loop, because a
+        partially written HDF5 is expensive to diagnose.
+
+    Notes
+    -----
+    The printed value counts are a cheap sanity check on the input table: the
+    FACS dataset is expected to contain exactly K562 and hPSC (Supplementary
+    Methods §5.5).
+    """
     unknown = set(cell_lines) - set(ONTOLOGY_TERM.keys())
     if unknown:
         raise ValueError(f'Unknown cell lines: {unknown}')
@@ -79,10 +211,18 @@ def check_ontology(cell_lines):
 
 
 # ── Perturbation parameters ──────────────────────────────────────
+# One AlphaGenome call per sequence; the API bills and rate-limits per request,
+# so batches are kept small (8) and the three strategies are spread over the
+# three API keys rather than enlarging the batch.
 BATCH_SIZE = 8
 WINDOW_SIZE = 512        # perturbation window size (512 bp)
 HALF_WINDOW = WINDOW_SIZE // 2  # 256 bp
 
+# AlphaGenome consumes exactly 1,048,576 bp (1 Mb) of sequence. The centre of
+# that window is 524,288, and the perturbed 512 bp interval is therefore
+# [524,032, 524,544) in *window-local* coordinates — i.e. 256 bp on each side
+# of the window centre. These are window offsets, NOT genomic coordinates: the
+# genomic position of the perturbed bases is ``row.begin + PERTURB_START``.
 # Center of the 1 Mb sequence is 524,288; perturbed region [524,032, 524,544)
 PERTURB_CENTER = 524288
 PERTURB_START = PERTURB_CENTER - HALF_WINDOW  # 524,032
@@ -97,6 +237,51 @@ def prepare_sequences_fast(batch_rows, hg38, chrom_len):
     Build WT / MASK / SHUFFLE sequences for a batch.
     MASK:   replace the fixed window (PERTURB_START:PERTURB_END) with N
     SHUFFLE: randomly shuffle the window (per-sample fixed seed, reproducible)
+
+    Parameters
+    ----------
+    batch_rows : pandas.DataFrame
+        Rows of the CRE table for one batch. Required columns: ``chr`` (str),
+        ``begin`` and ``stop`` (genomic window bounds, 0-based half-open),
+        ``cell_line``, ``id``. ``begin``/``stop`` are expected to already span
+        1 Mb around the CRE summit (built by the caller, see
+        ``build_cre_list`` / ``build_cre_df``).
+    hg38 : pyfaidx.Fasta
+        Indexed reference genome.
+    chrom_len : dict of str to int
+        Chromosome lengths, used to clip windows that run past the chromosome
+        end before padding.
+
+    Returns
+    -------
+    wt_seqs : list of str
+        Unperturbed 1,048,576 bp sequences, one per row.
+    mask_seqs : list of str
+        Same sequences with ``[524,032, 524,544)`` replaced by ``N``.
+    shuffle_seqs : list of str
+        Same sequences with ``[524,032, 524,544)`` shuffled in place.
+    cell_line : str
+        Cell line shared by the batch (the caller groups rows by cell line, so
+        this is taken from the first row and assumed homogeneous).
+
+    Notes
+    -----
+    * Sequences shorter than 1 Mb after clipping are *centre-padded* with ``N``
+      to exactly :data:`SEQUENCE_LENGTH_1MB`. ``str.center`` puts the extra
+      padding asymmetrically when the deficit is odd (the left side gets one
+      fewer ``N`` than the right), so for a window clipped at only one end the
+      perturbed offsets can be off by one base. This affects only CREs within
+      ~0.5 Mb of a chromosome end and does not change the assay for the
+      benchmark loci.
+    * The shuffle uses ``np.random.seed(114514 + i)`` where ``i`` is the
+      position within the batch — not a stable sample id. Batch composition
+      therefore influences the masked shuffle, though the seed itself makes a
+      given run reproducible.
+    * The ``N`` mask is a per-base substitution only; AlphaGenome receives the
+      same sequence length in all three arms, so any score difference is
+      attributable to the window content alone.
+    * Rows are re-iterated with ``iterrows()``, which yields views; nothing is
+      written back to ``batch_rows``.
     """
     n_samples = len(batch_rows)
     wt_seqs      = [None] * n_samples

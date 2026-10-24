@@ -105,6 +105,40 @@ class ParallelGatedMLP(nn.Module):
         model_parallel_size: int = 1,
         inner_mlp_size: Optional[int] = None,
     ):
+        """Build the two up-projections and the down-projection.
+
+        Parameters
+        ----------
+        hidden_size : int
+            Model width ``D``.
+        layer_idx : int
+            Block index; only used to decide whether the Evo2 activation rule
+            replaces the activation by ``nn.Identity()``.
+        inner_size_multiple_of : int, optional
+            Granularity for the heuristic inner width, multiplied by
+            ``model_parallel_size`` (default 64).
+        mlp_activation : {'gelu', 'silu'}, optional
+            Activation for the first branch (default ``'gelu'``).
+        evo2_style_activations : bool, optional
+            If True and ``layer_idx > 0``, drop the activation (default False).
+        model_parallel_size : int, optional
+            Tensor-parallel degree used only to widen ``multiple_of`` (default 1).
+        inner_mlp_size : int or None, optional
+            Explicit inner width; overrides the 8D/3 heuristic when given.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        * ``inner_size`` is computed as ``int(2 * D * 4 / 3)`` rounded up to a
+          multiple of ``multiple_of``, then **overwritten** by ``inner_mlp_size``
+          whenever that is given -- which it always is in eScreen (256), so the
+          heuristic and ``inner_size_multiple_of`` have no effect there.
+        * All three ``nn.Linear`` layers are bias-free, so the state_dict has no
+          ``.bias`` keys for this module.
+        """
         super().__init__()
 
         self.layer_idx = layer_idx

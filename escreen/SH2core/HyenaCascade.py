@@ -191,6 +191,71 @@ class HyenaCascade(nn.Module):
         prefill_style: str = "fft",
         bidirectional: bool = True
     ) -> None:
+        """Instantiate the short filter and one of the two long-filter forms.
+
+        Parameters
+        ----------
+        state_size : int
+            Number of poles/residues of the implicit long filter (16 in eScreen,
+            §2.1); used only when ``fir_inner_filter_length`` is None.
+        hidden_size : int
+            Model width ``D``.
+        num_filters : int
+            Number of filter systems; must divide ``hidden_size``.
+        num_attention_heads : int
+            Only used to derive the checkpoint's column layout
+            (``hidden_size_per_attention_head``), not for attention.
+        short_filter_length : int
+            Length of the depth-wise filter (3 in eScreen, §2.1).
+        short_filter_bias : bool, optional
+            Add a bias after the short filter (False in eScreen).
+        hyena_filter_groups : int, optional
+            Long-filter systems; 128 in eScreen, i.e. one per channel at D = 128.
+        fir_inner_filter_length : int or None, optional
+            Explicit FIR length, or None for the modal parameterisation.
+        layer_idx : int, optional
+            Block index, used as the state-dict key during decoding.
+        use_flashfft : bool, optional
+            Use the fused flashfftconv kernel (False in eScreen).
+        inference_mode : bool, optional
+            Stored but never read.
+        column_split_hyena : bool, optional
+            Checkpoint column layout; the True path of ``sequential_forward``
+            references an unimported helper, so it is unreachable here.
+        hyena_flip_x1x2 : bool, optional
+            Swap x1/x2 (checkpoint convention); False in eScreen.
+        use_flash_depthwise : bool, optional
+            Use the flash depth-wise conv kernel (False in eScreen).
+        depthwise_dtype : torch.dtype, optional
+            dtype for that kernel (unused when the flag is False).
+        long_fir_threshold : int or None, optional
+            Time-domain convolution for very long filters; None in eScreen.
+        interleave : bool, optional
+            Apply :func:`interleave` to the short-filter output (True in eScreen).
+        prefill_style : str, optional
+            KV-cache prefill strategy for the engine ("fft" in eScreen, unused).
+        bidirectional : bool, optional
+            Handed to the engine; only the FFT branch honours it.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        * The branch is chosen by ``if self.fir_inner_filter_length:`` -- an integer
+          length selects the explicit FIR, ``None`` the modal bank.
+        * The explicit FIR gets a learnable ``D`` **only** when its length is
+          >= 128, because that is the branch that runs the FFT convolution; the
+          short conv1d branch passes ``bias=None`` instead.
+        * ``D`` (the skip/feed-through gain) is zero-initialised in both branches so
+          the operator starts as a pure convolution.
+        * ``log_poles`` is initialised as ``-|N(0,1)|`` (float32) to keep the modal
+          system stable/causal; ``residues`` use ``randn``.
+        * ``self.interleave = interleave`` shadows the module-level ``interleave``
+          function inside this constructor only; ``forward`` still calls the
+          function.
+        """
         super().__init__()
         self.layer_idx = layer_idx
         self.hyena_filter_groups = hyena_filter_groups
