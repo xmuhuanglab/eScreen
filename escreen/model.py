@@ -21,8 +21,8 @@ from captum.attr import IntegratedGradients
 class eSCREEN_backbone(nn.Module):
     def __init__(self,filter_type='conv',d_model=32,num_filters=32,seq_length=500,celltype_num=32,mode='sequence',device='cpu',lr=1e-5,**kwargs):
         super().__init__()
-        # 定义模型架构
-        if filter_type == 'conv': # 使用随机初始化的卷积层进行嵌入
+        # define the model architecture
+        if filter_type == 'conv': # embed with a randomly initialized conv layer
             padding = 2
             self.conv0 = nn.Sequential(
                 nn.Conv1d(in_channels=4, out_channels=d_model//2, kernel_size=19, padding='same'),
@@ -31,32 +31,32 @@ class eSCREEN_backbone(nn.Module):
                 nn.ReLU(),
                 nn.Conv1d(in_channels=d_model//2, out_channels=d_model, kernel_size=7, padding='same'),
             ).to(torch.bfloat16)
-            self.motif_embedding = nn.Linear(d_model,d_model).to(torch.bfloat16) # 编码motif的embeding
-        elif filter_type == 'pwm': # 使用Motif PWM进行嵌入
+            self.motif_embedding = nn.Linear(d_model,d_model).to(torch.bfloat16) # embedding that encodes motifs
+        elif filter_type == 'pwm': # embed using motif PWMs
             kernel_fwd = kwargs.get('kernel_fwd')
             kernel_rev = kwargs.get('kernel_fwd')
             kernel_size = kernel_fwd.shape[-1]
-            # 计算确定的padding值：padding = (kernel_size - 1) // 2
+            # compute the deterministic padding: padding = (kernel_size - 1) // 2
             padding = (kernel_size - 1) // 2
             self.conv0 = nn.Conv1d(in_channels=4, out_channels=2*len(kernel_fwd), kernel_size=kernel_fwd.shape[-1], padding='same')
-            # 假设 kernel_fwd 和 kernel_rev 的形状为 [num_motifs, 4, kernel_size]
-            # 将它们拼接在维度0上（输出通道维度）
+            # assume kernel_fwd and kernel_rev have shape [num_motifs, 4, kernel_size]
+            # concatenate them along dim 0 (the output-channel dim)
             combined_weight = torch.cat([kernel_fwd, kernel_rev], dim=0)
             self.conv0.weight.data = combined_weight
             self.conv0.weight.requires_grad = False
             self.conv0 = self.conv0.to(torch.bfloat16)
-            self.motif_embedding = nn.Linear(2*len(kernel_fwd),d_model).to(torch.bfloat16) # 编码motif的embeding
-        elif filter_type == 'pwm-conv': # PWM混合卷积
-            pass # 暂时不支持，不考虑
-        elif filter_type == 'emb': # 使用embedding层
+            self.motif_embedding = nn.Linear(2*len(kernel_fwd),d_model).to(torch.bfloat16) # embedding that encodes motifs
+        elif filter_type == 'pwm-conv': # PWM hybrid convolution
+            pass # not supported yet, skipped
+        elif filter_type == 'emb': # use an embedding layer
             self.emb_layer = nn.Embedding(num_embeddings=6, embedding_dim=d_model, padding_idx=0)
             
         self.filter_type = filter_type
         
-        self.d_model = d_model # 特征维度数
-        self.seq_length = seq_length # 最长序列长度
+        self.d_model = d_model # feature dimension
+        self.seq_length = seq_length # maximum sequence length
         
-        self.HyenaCluster=nn.ModuleList([ # Hyena模块簇
+        self.HyenaCluster=nn.ModuleList([ # cluster of Hyena blocks
             self.get_block(
                 d_model=d_model,layer_idx=0,num_filters=d_model,num_attention_heads=8,hyena_filter_groups=128,fir_inner_filter_length=7,block_type='HyenaSE',**kwargs
             ),
@@ -81,24 +81,24 @@ class eSCREEN_backbone(nn.Module):
                               qkv_proj_bias      = False,
                               hyena_out_proj_bias= True,   
                               state_size  = 16,
-                              num_filters = kwargs['num_filters'], # 注意这个参数不能比hidden_size大
-                              num_attention_heads= kwargs['num_attention_heads'], # 这个参数和后面的attention层一致即可
+                              num_filters = kwargs['num_filters'], # note: this must not exceed hidden_size
+                              num_attention_heads= kwargs['num_attention_heads'], # just keep this consistent with the later attention layer
                               short_filter_length= 3,
                               short_filter_bias  = False,
-                              hyena_filter_groups    = kwargs['hyena_filter_groups'],     # 区分HyenaMR和HyenaSE,不能比d_model更大,需要被d_model整除
-                              fir_inner_filter_length= kwargs['fir_inner_filter_length'], # 参数是区分HyenaMR和HyenaSE的关键
-                              inner_size_multiple_of = 16,      # 这五个参数是MLP的参数
-                              mlp_activation         = 'gelu',  # 这五个参数是MLP的参数
-                              evo2_style_activations = True,    # 这五个参数是MLP的参数
-                              model_parallel_size    = 1,       # 这五个参数是MLP的参数
-                              inner_mlp_size         = 256,     # 这五个参数是MLP的参数
-                              column_split_hyena     = False, # 这个是HyenaCascade的参数
-                              interleave             = True,  # 这个是HyenaCascade的参数
-                              hyena_flip_x1x2        = False, # 这个是HyenaCascade的参数
-                              use_flash_depthwise    = False, # 这个是HyenaCascade的参数
-                              use_flashfft           = False, # 这个是HyenaCascade的参数
-                              prefill_style          = 'fft', # 这个是HyenaCascade的参数
-                              bidirectional          = True   # 这个是HyenaCascade的参数
+                              hyena_filter_groups    = kwargs['hyena_filter_groups'],     # distinguishes HyenaMR from HyenaSE; must not exceed d_model and must divide d_model
+                              fir_inner_filter_length= kwargs['fir_inner_filter_length'], # this parameter is key to distinguishing HyenaMR from HyenaSE
+                              inner_size_multiple_of = 16,      # these five parameters belong to the MLP
+                              mlp_activation         = 'gelu',  # these five parameters belong to the MLP
+                              evo2_style_activations = True,    # these five parameters belong to the MLP
+                              model_parallel_size    = 1,       # these five parameters belong to the MLP
+                              inner_mlp_size         = 256,     # these five parameters belong to the MLP
+                              column_split_hyena     = False, # this one belongs to HyenaCascade
+                              interleave             = True,  # this one belongs to HyenaCascade
+                              hyena_flip_x1x2        = False, # this one belongs to HyenaCascade
+                              use_flash_depthwise    = False, # this one belongs to HyenaCascade
+                              use_flashfft           = False, # this one belongs to HyenaCascade
+                              prefill_style          = 'fft', # this one belongs to HyenaCascade
+                              bidirectional          = True   # this one belongs to HyenaCascade
             ).to(torch.bfloat16)
         elif block_type=='HyenaMR':
             return ParallelGatedConvBlock(
@@ -108,23 +108,23 @@ class eSCREEN_backbone(nn.Module):
                               hyena_out_proj_bias=True,
                               state_size = 16,
                               num_filters= kwargs['num_filters'],
-                              num_attention_heads    = kwargs['num_attention_heads'], # 这个参数和后面的attention层一致即可
+                              num_attention_heads    = kwargs['num_attention_heads'], # just keep this consistent with the later attention layer
                               short_filter_length    = 3,
                               short_filter_bias      = False,
-                              hyena_filter_groups    = kwargs['hyena_filter_groups'],     # 区分HyenaMR和HyenaSE,不能比d_model更大,需要被d_model整除
-                              fir_inner_filter_length= kwargs['fir_inner_filter_length'], # 参数是区分HyenaMR和HyenaSE的关键
-                              inner_size_multiple_of = 16,     # 这五个参数是MLP的参数
-                              mlp_activation         = 'gelu', # 这五个参数是MLP的参数
-                              evo2_style_activations = True,   # 这五个参数是MLP的参数
-                              model_parallel_size    = 1,      # 这五个参数是MLP的参数
-                              inner_mlp_size         = 256,    # 这五个参数是MLP的参数
-                              column_split_hyena     = False, # 这个是HyenaCascade的参数
-                              interleave             = True,  # 这个是HyenaCascade的参数
-                              hyena_flip_x1x2        = False, # 这个是HyenaCascade的参数
-                              use_flash_depthwise    = False, # 这个是HyenaCascade的参数
-                              use_flashfft           = False, # 这个是HyenaCascade的参数
-                              prefill_style          = 'fft', # 这个是HyenaCascade的参数
-                              bidirectional          = True   # 这个是HyenaCascade的参数
+                              hyena_filter_groups    = kwargs['hyena_filter_groups'],     # distinguishes HyenaMR from HyenaSE; must not exceed d_model and must divide d_model
+                              fir_inner_filter_length= kwargs['fir_inner_filter_length'], # this parameter is key to distinguishing HyenaMR from HyenaSE
+                              inner_size_multiple_of = 16,     # these five parameters belong to the MLP
+                              mlp_activation         = 'gelu', # these five parameters belong to the MLP
+                              evo2_style_activations = True,   # these five parameters belong to the MLP
+                              model_parallel_size    = 1,      # these five parameters belong to the MLP
+                              inner_mlp_size         = 256,    # these five parameters belong to the MLP
+                              column_split_hyena     = False, # this one belongs to HyenaCascade
+                              interleave             = True,  # this one belongs to HyenaCascade
+                              hyena_flip_x1x2        = False, # this one belongs to HyenaCascade
+                              use_flash_depthwise    = False, # this one belongs to HyenaCascade
+                              use_flashfft           = False, # this one belongs to HyenaCascade
+                              prefill_style          = 'fft', # this one belongs to HyenaCascade
+                              bidirectional          = True   # this one belongs to HyenaCascade
             ).to(torch.bfloat16)
         elif block_type=='HyenaLI':
             return ParallelGatedConvBlock(
@@ -134,24 +134,24 @@ class eSCREEN_backbone(nn.Module):
                               hyena_out_proj_bias=True,
                               state_size = 16,
                               num_filters= kwargs['num_filters'],
-                              num_attention_heads= kwargs['num_attention_heads'], # 这个参数和后面的attention层一致即可
+                              num_attention_heads= kwargs['num_attention_heads'], # just keep this consistent with the later attention layer
                               short_filter_length= 3,
                               short_filter_bias  = False,
                               proj_groups        = 1,
-                              # 没有hyena_filter_groups和fir_inner_filter_length两个参数时就变为HyenaLI
-                              # 原来的配置里use_flashfft=False,所以这里也不传递快速卷积模块
-                              inner_size_multiple_of =16,     # 这五个参数是MLP的参数
-                              mlp_activation         ='gelu', # 这五个参数是MLP的参数
-                              evo2_style_activations =True,   # 这五个参数是MLP的参数
-                              model_parallel_size    =1,      # 这五个参数是MLP的参数
-                              inner_mlp_size         =256,    # 这五个参数是MLP的参数
-                              column_split_hyena     = False, # 这个是HyenaCascade的参数
-                              interleave             = True,  # 这个是HyenaCascade的参数
-                              hyena_flip_x1x2        = False, # 这个是HyenaCascade的参数
-                              use_flash_depthwise    = False, # 这个是HyenaCascade的参数
-                              use_flashfft           = False, # 这个是HyenaCascade的参数
-                              prefill_style          = 'fft', # 这个是HyenaCascade的参数
-                              bidirectional          = True   # 这个是HyenaCascade的参数
+                              # without hyena_filter_groups and fir_inner_filter_length it becomes HyenaLI
+                              # the original config had use_flashfft=False, so the fast-conv module is not passed here either
+                              inner_size_multiple_of =16,     # these five parameters belong to the MLP
+                              mlp_activation         ='gelu', # these five parameters belong to the MLP
+                              evo2_style_activations =True,   # these five parameters belong to the MLP
+                              model_parallel_size    =1,      # these five parameters belong to the MLP
+                              inner_mlp_size         =256,    # these five parameters belong to the MLP
+                              column_split_hyena     = False, # this one belongs to HyenaCascade
+                              interleave             = True,  # this one belongs to HyenaCascade
+                              hyena_flip_x1x2        = False, # this one belongs to HyenaCascade
+                              use_flash_depthwise    = False, # this one belongs to HyenaCascade
+                              use_flashfft           = False, # this one belongs to HyenaCascade
+                              prefill_style          = 'fft', # this one belongs to HyenaCascade
+                              bidirectional          = True   # this one belongs to HyenaCascade
             ).to(torch.bfloat16)
         elif block_type=='Attention':
             return AttentionBlock(
@@ -163,12 +163,12 @@ class eSCREEN_backbone(nn.Module):
                               mlp_dtype          = kwargs.get('mlp_dtype',torch.bfloat16),
                               mha_out_proj_bias  = kwargs.get('mha_out_proj_bias',True),
                               qkv_proj_bias      = kwargs.get('qkv_proj_bias',False),
-                              use_flash_attn     = kwargs.get('use_flash_attn',False),  # CUDA 12.4才能用flash attention
-                              inner_size_multiple_of = 16,     # 这五个参数是MLP的参数
-                              mlp_activation         = 'gelu', # 这五个参数是MLP的参数
-                              evo2_style_activations = True,   # 这五个参数是MLP的参数
-                              model_parallel_size    = 1,      # 这五个参数是MLP的参数
-                              inner_mlp_size         = 256     # 这五个参数是MLP的参数
+                              use_flash_attn     = kwargs.get('use_flash_attn',False),  # flash attention requires CUDA 12.4
+                              inner_size_multiple_of = 16,     # these five parameters belong to the MLP
+                              mlp_activation         = 'gelu', # these five parameters belong to the MLP
+                              evo2_style_activations = True,   # these five parameters belong to the MLP
+                              model_parallel_size    = 1,      # these five parameters belong to the MLP
+                              inner_mlp_size         = 256     # these five parameters belong to the MLP
             ).to(torch.bfloat16)
             
     def move(self):
@@ -194,16 +194,16 @@ class eSCREEN_backbone(nn.Module):
     def forward(self,x,return_emb=False):
         
         if self.filter_type == 'emb':
-            ### 直接嵌入,这个时候的形状从原始的(b,l)变为(b,l,d)
+            ### direct embedding: the shape changes from (b,l) to (b,l,d)
             x = self.emb_layer(x.to(torch.int))
         else:
-            ### 扫motif,这个时候的形状从原始的(b,l,4)变为(b,4,l)再变为(b, ck, l)
+            ### motif scan: the shape changes from (b,l,4) to (b,4,l) and then to (b, ck, l)
             x = rearrange( x, 'b l c -> b c l').to(torch.bfloat16)
             x = nn.functional.relu(self.conv0(x))
-            x = rearrange( x, 'b c l -> b l c') # 把通道放到最后一个维度
-            x = self.motif_embedding(x)         # 把特征映射到d_model
+            x = rearrange( x, 'b c l -> b l c') # move channels to the last dim
+            x = self.motif_embedding(x)         # map features to d_model
         
-        ### 通过stripedHyena层和header层,形状维持(batch,ls+lc,d_model)
+        ### through the stripedHyena and header layers the shape stays (batch,ls+lc,d_model)
         x = x.to(torch.bfloat16)
         for layer in self.HyenaCluster:
             x = x + layer(x)
@@ -214,7 +214,7 @@ class eSCREEN_backbone(nn.Module):
 
     
 class FlexibleFFN(nn.Module):
-    """灵活的前馈网络，支持可变层数"""
+    """Flexible feed-forward network supporting a variable number of layers"""
     def __init__(self, input_dim, output_dim, hidden_dims=None, dropout=0.1):
         super().__init__()
         if hidden_dims is None:
@@ -237,59 +237,59 @@ class FlexibleFFN(nn.Module):
 
 class CellConditionedLoRA(nn.Module):
     """
-    Cell-Conditioned LoRA: 为每个细胞系生成低秩变换矩阵
+    Cell-Conditioned LoRA: generate a low-rank transform per cell line
     delta = x @ A @ B
-    其中 A = f_A(ct_emb) ∈ [B, D, r]
+    where A = f_A(ct_emb) in [B, D, r]
          B = f_B(ct_emb) ∈ [B, r, D]
     
-    初始化策略：B初始化为零 → delta初始为0 → 初始时等价于恒等映射
+    Init strategy: B starts at zero -> delta starts at 0 -> initially equivalent to the identity map
     """
     def __init__(self, d_model, rank=4, alpha=1.0):
         super().__init__()
         self.d_model = d_model
         self.rank = rank
         
-        # 生成A矩阵（down-projection）
+        # produce the A matrix (down-projection)
         self.f_A = nn.Sequential(
             nn.Linear(d_model, 32),
             nn.GELU(),
             nn.Linear(32, d_model * rank)
         )
         
-        # 生成B矩阵（up-projection）
+        # produce the B matrix (up-projection)
         self.f_B = nn.Sequential(
             nn.Linear(d_model, 32),
             nn.GELU(),
             nn.Linear(32, rank * d_model)
         )
         
-        # 关键初始化：f_B的最后一层权重和偏置置零
-        # 这样初始时B=0，delta=0，不改变原始表示
+        # key init: zero the weights and bias of the last f_B layer
+        # so initially B=0 and delta=0, leaving the representation unchanged
         nn.init.zeros_(self.f_B[-1].weight)
         nn.init.zeros_(self.f_B[-1].bias)
         
-        # A正常初始化（小值）
+        # initialize A normally (small values)
         nn.init.normal_(self.f_A[-1].weight, std=0.02)
         nn.init.zeros_(self.f_A[-1].bias)
         
-        # 可学习的缩放因子，初始化为小值
+        # learnable scaling factor, initialized small
         self.alpha = nn.Parameter(torch.tensor(alpha))
     
     def forward(self, x, ct_emb):
         """
-        x: [B, L, D] 或 [B, D]（兼容pooled特征）
+        x: [B, L, D] or [B, D] (also accepts pooled features)
         ct_emb: [B, D]
         """
         B = x.size(0)
         
-        # 生成A和B
+        # produce A and B
         A_flat = self.f_A(ct_emb)  # [B, D * rank]
         B_flat = self.f_B(ct_emb)  # [B, rank * D]
         
         A = A_flat.view(B, self.d_model, self.rank)  # [B, D, r]
         B = B_flat.view(B, self.rank, self.d_model)  # [B, r, D]
         
-        # 计算 delta = x @ A @ B
+        # compute delta = x @ A @ B
         if x.dim() == 3:
             # [B, L, D] @ [B, D, r] @ [B, r, D] → [B, L, D]
             x_A = torch.bmm(x, A)  # [B, L, r]
@@ -306,10 +306,10 @@ class PrototypeDecoder(nn.Module):
     def __init__(self, d_model, K=8):
         super().__init__()
         self.K = K
-        # K 个原型头，每个都是 d_model -> 1 的线性层（或小MLP）
+        # K prototype heads, each a d_model -> 1 linear layer (or small MLP)
         self.proto_W = nn.Parameter(torch.randn(K, d_model, 1) * 0.02)
         self.proto_b = nn.Parameter(torch.zeros(K, 1))
-        # 路由器：细胞嵌入 -> 注意力分数
+        # router: cell embedding -> attention scores
         self.router = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
@@ -321,8 +321,8 @@ class PrototypeDecoder(nn.Module):
         # h: [B, d_model]
         attn_scores = self.router(ct_emb)          # [B, K]
         attn_weights = F.softmax(attn_scores, dim=-1)  # [B, K]
-        # 每个原型的输出：[B, K, 1]
-        # 批量计算：h [B,1,d_model]  @ proto_W [K,d_model,1] -> [B,K,1]
+        # per-prototype output: [B, K, 1]
+        # batched: h [B,1,d_model] @ proto_W [K,d_model,1] -> [B,K,1]
         proto_out = torch.einsum('bd,kdo->bko', h, self.proto_W).squeeze(-1) + self.proto_b.squeeze(-1)  # [B, K]
         out = (proto_out * attn_weights).sum(dim=-1, keepdim=True)  # [B, 1]
         #return torch.sigmoid(out)

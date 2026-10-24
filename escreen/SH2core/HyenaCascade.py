@@ -121,8 +121,8 @@ class HyenaCascade(nn.Module):
             else:
                 self.D = None
         else:
-            log_poles = -1*torch.abs(torch.randn(self.num_systems, self.state_size, 1, dtype=torch.float32)) # 这里是初始化
-            self.log_poles = nn.Parameter(log_poles) # 这里把log_poles注册为一个可学习的参数
+            log_poles = -1*torch.abs(torch.randn(self.num_systems, self.state_size, 1, dtype=torch.float32)) # initialization happens here
+            self.log_poles = nn.Parameter(log_poles) # log_poles is registered here as a learnable parameter
             self.residues = nn.Parameter(torch.randn(self.num_systems, self.state_size, dtype=torch.float32))
             self.D = nn.Parameter(torch.zeros(self.hidden_size))
             self.h = None
@@ -203,21 +203,21 @@ class HyenaCascade(nn.Module):
             
             y = self.engine.parallel_iir(
                 z_pre,
-                h,                       # h在不输入fir_inner_fn的情况下也一定是None
-                D,                       # D是大小(hidden_size,)的可学习参数
-                L,                       # L是输入序列的长度
-                t=self.t,                # 反正t一定是None
+                h,                       # h is also always None when fir_inner_fn is not provided
+                D,                       # D is a learnable parameter of size (hidden_size,)
+                L,                       # L is the input sequence length
+                t=self.t,                # t is always None anyway
                 poles=self.log_poles,
                 residues=self.residues,
                 dims=dims,
-                inference_params=inference_params,           # inference_params也一定是None
-                layer_idx=self.layer_idx,                    # layer_idx是一个索引,不参与计算
-                prefill_style=self.prefill_style,            # 不参与计算
-                use_flashfft=self.use_flashfft,              # 不参与计算
-                fftconv_fn=self.fftconv_fn,                  # 不参与计算
-                column_split_hyena=self.column_split_hyena,  # 不参与计算
-                long_fir_threshold=self.long_fir_threshold,  # 不参与计算
-                padding_mask=padding_mask,                   # padding_mask也一定是None
+                inference_params=inference_params,           # inference_params is also always None
+                layer_idx=self.layer_idx,                    # layer_idx is an index and does not take part in computation
+                prefill_style=self.prefill_style,            # not used in computation
+                use_flashfft=self.use_flashfft,              # not used in computation
+                fftconv_fn=self.fftconv_fn,                  # not used in computation
+                column_split_hyena=self.column_split_hyena,  # not used in computation
+                long_fir_threshold=self.long_fir_threshold,  # not used in computation
+                padding_mask=padding_mask,                   # padding_mask is also always None
             )
 
         return y, inference_params
@@ -297,5 +297,5 @@ class HyenaCascade(nn.Module):
             self.log_poles.to(filter_dtype),
         )
         
-        h = (residues[..., None] * (log_poles * self.t).exp()).sum(1)[None]  # B, D, L ## 这里如果t很大就可能会溢出
+        h = (residues[..., None] * (log_poles * self.t).exp()).sum(1)[None]  # B, D, L ## this may overflow if t is large
         return h, filter_dtype, log_poles, residues

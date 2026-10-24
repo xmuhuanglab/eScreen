@@ -216,7 +216,7 @@ class HyenaFilter(OptimModule):
     def forward(self, x, L, k=None, bias=None, *args, **kwargs):
         if k is None: k = self.filter(L)
         #print('fft_x:',x.sum(axis=2)[:,:6])
-        ## 问题出在这一步傅里叶卷积操作，这一步被送进来的x还是不同的
+        ## The problem is in this FFT convolution step: the x fed in here is still different
         # Ensure compatibility with filters that return a tuple
         k = k[0] if type(k) is tuple else k
 
@@ -281,7 +281,7 @@ class HyenaOperator(nn.Module):
         uc = self.short_filter(u)[...,:l_filter]
         *x, v = uc.split(self.d_model, dim=1)
 
-        k = self.filter_fn.filter(l_filter)[0] #输入的l_filter是一个标量,所以这个地方不太可能产生变化
+        k = self.filter_fn.filter(l_filter)[0] # the input l_filter is a scalar, so it is unlikely to change here
         k = rearrange(k, 'l (o d) -> o d l', o=self.order - 1)
         bias = rearrange(self.filter_fn.bias, '(o d) -> o d', o=self.order - 1)
 
@@ -289,32 +289,32 @@ class HyenaOperator(nn.Module):
         #    v = self.dropout(v * x_i)
         #    v = self.filter_fn(v, l_filter, k=k[o], bias=bias[o])
         
-        #### 人工增加一个反向递归  ####
+        #### manually add a reverse recurrence  ####
         #print('Using Bi-direction filter in {} element'.format(len(x)))
 
         v_f = x[0]
         for o, x_i in enumerate(reversed(x[1:])):
             #print('x_i:' , x_i.sum(axis=2)[:,:6])
-            ### 到这里位置两边对前面还是有影响的
+            ### up to here both sides still affect the earlier part
             v_f = self.dropout(v_f * x_i)
             #print('v_f:' , v_f.sum(axis=2)[:,:6])
             #print('v_f shape:' , v_f.shape)
-            # 形状是 (batch_size, d_model, seq_length)
+            # shape is (batch_size, d_model, seq_length)
             v_f = self.filter_fn(v_f, l_filter, k=k[o], bias=bias[o])
             #print('v_f:' , v_f.sum(axis=2)[:,:6])
-            ### 到这里就变成完全一样了
+            ### up to here it becomes exactly the same
 
         v_r = x[0]
         for o, x_i in enumerate(reversed(x[1:])):
             #print('x_i:' , x_i.sum(axis=2)[:,:6])
-            ### 到这里位置两边对前面还是有影响的
+            ### up to here both sides still affect the earlier part
             v_r = self.dropout(v_r * x_i)
             #print('v_f:' , v_f.sum(axis=2)[:,:6])
             #print('v_f shape:' , v_f.shape)
-            # 形状是 (batch_size, d_model, seq_length)
+            # shape is (batch_size, d_model, seq_length)
             v_r = self.filter_fn(torch.flip(v_r, dims=[2]), l_filter, k=k[o], bias=bias[o])
             #print('v_f:' , v_f.sum(axis=2)[:,:6])
-            ### 到这里就变成完全一样了
+            ### up to here it becomes exactly the same
         
         #v = ( v_f * x[0] + v_r * x[-1] )*0.5
         v = (v_f + v_r ) * x[0] * 0.5
@@ -554,7 +554,7 @@ class Block(nn.Module):
         """
         if self.prenorm:
             # print('Using prenorm')
-            ## 预训练模型是使用prenorm模块的
+            ## the pretrained model uses the prenorm module
             dropped = self.drop_path1(self.dropout1(hidden_states))
             residual = (dropped + residual) if residual is not None else dropped
             hidden_states = self.norm1(residual.to(dtype=self.norm1.weight.dtype))
@@ -567,7 +567,7 @@ class Block(nn.Module):
             #print('hidden states:', hidden_states.sum(axis=2)[:,:6])
             hidden_states = self.mixer(hidden_states, **mixer_kwargs)
             #print('hidden states:', hidden_states.sum(axis=2)[:,:6])
-            ### 编码只影响后面从这个地方开始的
+            ### the encoding only affects positions after this point
             if mixer_subset is not None:
                 residual = residual[:, mixer_subset]
             if not isinstance(self.mlp, nn.Identity):
@@ -767,14 +767,14 @@ class LMBackbone(nn.Module):
 
     def forward(self, input_ids, position_ids=None):
         hidden_states = self.embeddings(input_ids, position_ids=position_ids,)
-        #print('hidden embedding:',hidden_states.sum(axis=2)) ## 在这一步的编码确实只根据每个位置上的字符决定
+        #print('hidden embedding:',hidden_states.sum(axis=2)) ## at this step the encoding indeed depends only on the character at each position
         residual = None
 
         for layer in self.layers:
             #print(layer)
             hidden_states, residual = layer(hidden_states, residual)
             #print('hidden embedding:',hidden_states.sum(axis=2)[:,:6])
-            # 在第一层就有变化了
+            # it already changes at the first layer
 
         dropped = self.drop_f(hidden_states)
         residual = (dropped + residual) if residual is not None else dropped

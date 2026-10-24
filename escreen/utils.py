@@ -12,52 +12,52 @@ class boost_sampler():
     
     def __init__(self, labels, smoothing=1.0, temperature=0.7, seed=114514):
         """
-        初始化采样器，预计算 平滑概率分布。
+        Initialize the sampler and precompute the smoothed probability distribution.
         
         Args:
-            labels: 训练集的标签列表或 array。
-            smoothing: 拉普拉斯平滑系数，建议 1.0。
-            temperature: 温度系数，0.5-0.7 可有效防止过拟合。
-            seed: 随机种子，确保实验可重复性。
+            labels: training-set labels as a list or array.
+            smoothing: Laplace smoothing factor, 1.0 recommended.
+            temperature: temperature factor, 0.5-0.7 effectively prevents overfitting.
+            seed: random seed for reproducibility.
         """
         self.labels = np.array(labels)
         self.smoothing = smoothing
         self.temperature = temperature
-        self.rng = np.random.default_rng(seed)  # 使用更安全的 numpy 随机生成器
+        self.rng = np.random.default_rng(seed)  # use the safer numpy random generator
         
-        # 预计算采样概率，避免每个 Epoch 重复计算
+        # precompute sampling probabilities to avoid recomputing every epoch
         self.prob_dist = self._precompute_probabilities()
 
     def _precompute_probabilities(self):
         n_total = len(self.labels)
         classes, counts = np.unique(self.labels, return_counts=True)
         
-        # 1. 计算平滑权重: w = N / (count + alpha)
+        # 1. compute smoothed weights: w = N / (count + alpha)
         smoothed_counts = counts + self.smoothing
         class_weights_raw = n_total / smoothed_counts
         
-        # 2. 温度缩放: w = w^T
-        # T < 1.0 会压缩高权重与低权重之间的差距
+        # 2. temperature scaling: w = w^T
+        # T < 1.0 shrinks the gap between high and low weights
         class_weights_map = {
             cls: np.power(class_weights_raw[i], self.temperature) 
             for i, cls in enumerate(classes)
         }
         
-        # 3. 映射并归一化
+        # 3. map and normalize
         sample_weights = np.array([class_weights_map[l] for l in self.labels])
         return sample_weights / np.sum(sample_weights)
 
     def get(self, num_samples=None):
         """
-        在每个 Epoch 调用，获取重采样后的索引。
+        Called each epoch to obtain the resampled indices.
         
         Args:
-            num_samples: 采样数量，默认为数据集全长。
+            num_samples: number of samples, defaults to the full dataset length.
         """
         n_total = len(self.labels)
         size = num_samples if num_samples is not None else n_total
         
-        # 执行带放回抽样 (Replacement=True 是处理不平衡的核心)
+        # sample with replacement (Replacement=True is the core of handling imbalance)
         indices = self.rng.choice(
             np.arange(n_total), 
             size=size, 

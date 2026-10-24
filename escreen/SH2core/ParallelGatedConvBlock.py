@@ -21,8 +21,8 @@ class ParallelGatedConvBlock(nn.Module):
         mlp_dtype: torch.dtype = torch.bfloat16,
         use_fp8_input_projections: bool = False,
         compile: bool = False,
-        *args,   # 没有出现在上面的位置参数
-        **kwargs # 没有出现在上面的关键字参数
+        *args,   # positional arguments not listed above
+        **kwargs # keyword arguments not listed above
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx

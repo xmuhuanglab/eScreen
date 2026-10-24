@@ -136,7 +136,7 @@ def safe_log(a, base=2):
     a = np.array(a)  
     result = np.zeros_like(a, dtype=np.float64)
     positive_mask = a > 0
-    result[positive_mask] = np.log(a[positive_mask]) / np.log(base)  # 使用换底公式
+    result[positive_mask] = np.log(a[positive_mask]) / np.log(base)  # use the change-of-base formula
     if isinstance(a, pd.Series):
         return pd.Series(result)
     return result

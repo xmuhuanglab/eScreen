@@ -44,8 +44,8 @@ def parse_meme_file(file_path):
     return motifs_matrix, motif_names
 
 def normalize_motif(x):
-    mean = x.mean(dim=2, keepdim=True)  # 形状: (batch_size, 1, channels)
-    std = x.std(dim=2, keepdim=True)    # 形状: (batch_size, 1, channels)
+    mean = x.mean(dim=2, keepdim=True)  # shape: (batch_size, 1, channels)
+    std = x.std(dim=2, keepdim=True)    # shape: (batch_size, 1, channels)
     return x-mean
 
 def move_zeros_to_end(arr):
@@ -104,13 +104,13 @@ def load_pwm_from_meme_c(file_path, max_length=29):
     with open(file_path, "r") as f:
         lines = f.readlines()
 
-    motifs = []  # 存储原始矩阵
-    complementary_motifs = []  # 存储互补矩阵
-    motif_length = [] # 存储motif的长度
+    motifs = []  # store the forward matrices
+    complementary_motifs = []  # store the reverse-complement matrices
+    motif_length = [] # store the motif lengths
     current_motif = None
     current_complementary_motif = None
     alphabet = lines[2].split()[1]
-    # 跳过前10行
+    # skip the first 10 lines
     lines = lines[9:]
     for i, line in enumerate(lines):
         if line.startswith("MOTIF"):
@@ -143,7 +143,7 @@ def load_pwm_from_meme_c(file_path, max_length=29):
             current_complementary_motif["letter_prob_matrix"] /= current_complementary_motif["letter_prob_matrix"].max(axis=-1,keepdims=True)
             current_complementary_motif["letter_prob_matrix"] /= current_complementary_motif["width"]
             
-            # 填充到 max_length
+            # pad to max_length
             if current_motif["width"] < max_length:
                 pad_length = max_length - current_motif["width"]
                 current_motif["letter_prob_matrix"] = np.concatenate(
@@ -155,11 +155,11 @@ def load_pwm_from_meme_c(file_path, max_length=29):
                     axis=0,
                 )
     if current_motif is not None:
-        # 填充到 max_length
+        # pad to max_length
         motifs.append(current_motif)
         complementary_motifs.append(current_complementary_motif)
 
-    # 将原始矩阵和互补矩阵堆叠成 numpy 数组
+    # stack the forward and reverse-complement matrices into numpy arrays
     motifs_matrix = np.stack([motif["letter_prob_matrix"] for motif in motifs], axis=0)
     complementary_motifs_matrix = np.stack([motif["letter_prob_matrix"] for motif in complementary_motifs], axis=0)
     motif_names = [motif["name"] for motif in motifs]
@@ -175,13 +175,13 @@ def load_pwm_from_meme_c1(file_path, max_length=29, norm='minmax'):
     
     with open(file_path, "r") as f:lines = f.readlines()
 
-    motifs = []  # 存储原始矩阵
-    complementary_motifs = []  # 存储互补矩阵
-    motif_length = []  # 存储 motif 的长度
+    motifs = []  # store the forward matrices
+    complementary_motifs = []  # store the reverse-complement matrices
+    motif_length = []  # store the motif lengths
     current_motif = None
     current_complementary_motif = None
     alphabet = lines[2].split()[1]
-    lines = lines[9:]  # 跳过前9行
+    lines = lines[9:]  # skip the first 9 lines
 
     for i, line in enumerate(lines):
         if line.startswith("MOTIF"):
@@ -208,7 +208,7 @@ def load_pwm_from_meme_c1(file_path, max_length=29, norm='minmax'):
             current_motif["width"] = len(letter_prob_matrix)
             current_complementary_motif["width"] = current_motif["width"]
 
-            # 标准化处理
+            # normalization
             if norm is None or norm == 'none':
                 pass
             elif norm == 'minmax':
@@ -228,7 +228,7 @@ def load_pwm_from_meme_c1(file_path, max_length=29, norm='minmax'):
                 #nucleotide_prob = np.ones((current_motif["width"], 4)) * 0.25
                 s,d = scoreDist(current_motif["letter_prob_matrix"], nucleotide_prob=nucleotide_prob, gran=None, size=1000)
                 cdf = np.cumsum(d)
-                params, _ = curve_fit(logit_func, s, cdf, maxfev=1000) # 通过拟合曲线获取修正系数和偏置
+                params, _ = curve_fit(logit_func, s, cdf, maxfev=1000) # obtain the correction coefficients and bias by curve fitting
                 w, b = params
                 current_motif["letter_prob_matrix"] *= w
                 current_motif["bias"]               = b
@@ -241,14 +241,14 @@ def load_pwm_from_meme_c1(file_path, max_length=29, norm='minmax'):
                 #nucleotide_prob = np.ones((current_motif["width"], 4)) * 0.25
                 s,d = scoreDist(current_complementary_motif["letter_prob_matrix"], nucleotide_prob=nucleotide_prob, gran=None, size=1000)
                 cdf = np.cumsum(d)
-                params, _ = curve_fit(logit_func, s, cdf, maxfev=1000) # 通过拟合曲线获取修正系数和偏置
+                params, _ = curve_fit(logit_func, s, cdf, maxfev=1000) # obtain the correction coefficients and bias by curve fitting
                 w, b = params
                 current_complementary_motif["letter_prob_matrix"] *= w
                 current_complementary_motif["bias"]               = b
             else:
                 print('Unsupported normlization methods, return raw matrix')
 
-            # 中央对齐填充
+            # center-aligned padding
             if current_motif["width"] < max_length:
                 pad_total = max_length - current_motif["width"]
                 pad_top = pad_total // 2
@@ -268,7 +268,7 @@ def load_pwm_from_meme_c1(file_path, max_length=29, norm='minmax'):
         motifs.append(current_motif)
         complementary_motifs.append(current_complementary_motif)
 
-    # 堆叠 numpy 矩阵
+    # stack the numpy matrices
     motifs_matrix = np.stack([motif["letter_prob_matrix"] for motif in motifs], axis=0)
     motifs_bias   = np.array([motif["bias"] for motif in motifs])
     complementary_motifs_matrix = np.stack([motif["letter_prob_matrix"] for motif in complementary_motifs], axis=0)
