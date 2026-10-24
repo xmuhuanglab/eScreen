@@ -127,17 +127,24 @@ def init_model():
 
     Notes
     -----
-    * Motif kernels come from ``data/consensus_pwms.meme`` via
+    * Both kernel tensors come from ``data/consensus_pwms.meme`` through
       ``escreen.motif.load_pwm_from_meme_c(..., max_length=35)``, i.e. the
-      forward/reverse-complement PWM pairs padded to 35 bp described in
-      Supplementary Methods section 2.3.6, assigned as the frozen Conv1d weights.
+      forward and reverse-complement PWM blocks padded to 35 bp as described in
+      Supplementary Methods section 2.3.6.  Note that
+      ``eSCREEN_backbone(filter_type='pwm')`` reads ``kwargs['kernel_fwd']``
+      twice, so the reverse-complement tensor computed here is currently ignored
+      and the 1,274 motif channels are the 637 forward PWMs duplicated rather
+      than 637 forward + 637 reverse - a known mismatch with the manuscript (see
+      the note in ``escreen/model.py``).  This function still builds and passes
+      both, so fixing the backbone needs no change here.
     * Cell-type conditioning uses the Geneformer embeddings of
       ``data/DepMap_CellLine_embedding.pkl`` (mean-pooled DepMap bulk RNA-seq,
       Supplementary Methods section 2.3.5) plus the Geneformer V1-10M model and
       its 30M gene dictionaries under ``data/geneformer/``.
-    * ``num_filters=256`` is the width of the learnable projection applied to the
-      motif activations; the number of motif channels itself is implied by the
-      PWM tensor (1,274 filters), not by this argument.
+    * In the ``'pwm'`` branch the Conv1d width is ``2 * len(kernel_fwd)``
+      (1,274) and the trainable projection goes to ``d_model`` (256), so
+      ``num_filters=256`` does not size the motif layer at all; it is the
+      ``conv``/``emb`` branches that consume it.
     * ``load_state_dict(..., strict=False)`` tolerates missing and extra keys
       silently, so a mismatched checkpoint degrades to partly random weights with
       no warning.  Inspect the returned ``_IncompatibleKeys`` if that matters.
@@ -158,6 +165,9 @@ def init_model():
     meme_file = str(DATA_DIR / "consensus_pwms.meme")
     motifs_f, motifs_r, _, _ = load_pwm_from_meme_c(meme_file, max_length=35)
     kernel_fwd = torch.tensor(motifs_f, dtype=torch.float)
+    # NOTE (documented, not fixed): the backbone currently reads kernel_fwd for
+    # both strands, so kernel_rev is built but never consumed; see the note in
+    # eSCREEN_backbone's 'pwm' branch.
     kernel_rev = torch.tensor(motifs_r, dtype=torch.float)
 
     # Geneformer cell-type embeddings (Supplementary Methods section 2.3.5) and
@@ -179,6 +189,9 @@ def init_model():
         device=DEVICE,
     )
 
+    # filter_type='pwm' selects the motif-initialised input stage: the Conv1d
+    # weights are assigned from the PWM tensor and frozen inside the backbone,
+    # so only the following 1274 -> d_model projection is trained.
     backbone = eSCREEN_backbone(
         filter_type='pwm', kernel_fwd=kernel_fwd, kernel_rev=kernel_rev,
         d_model=d_model, num_filters=256,

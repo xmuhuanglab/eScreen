@@ -375,9 +375,79 @@ import numpy as np
 from transformers import BertForMaskedLM
 
 class Geneformer(nn.Module):
+    """Geneformer wrapper used to build the eScreen cell-type embedding.
+
+    This is the production path of Supplementary Methods Section 2.3.5.  A
+    pretrained Geneformer checkpoint (V1 by default) encodes a bulk RNA-seq
+    profile; the hidden states of the penultimate layer are mean-pooled over the
+    valid gene tokens to give one vector per cell line.  That vector then
+    conditions the sequence model.
+
+    The tokenisation mirrors Geneformer's own ``TranscriptomeTokenizer`` step for
+    step -- filter undetected genes, map symbols to Ensembl IDs, normalise to a
+    fixed target sum, divide by the per-gene median, sort by descending
+    normalised expression, truncate -- because the pretrained model only behaves
+    correctly on inputs prepared that way.
+
+    Parameters
+    ----------
+    TOKEN_DICTIONARY_FILE : str
+        Pickle mapping ``ensembl_id -> token_id``.
+    GENE_MEDIAN_FILE : str
+        Pickle mapping ``ensembl_id -> median expression``, used as the
+        per-gene normalisation divisor.
+    ENSEMBL_DICTIONARY_FILE : str
+        Pickle mapping gene symbol -> Ensembl ID, needed for DepMap input.
+    ENSEMBL_MAPPING_FILE : str or None
+        Pickle mapping Ensembl ID -> canonical Ensembl ID (strips version
+        suffixes and resolves synonyms).  If None, an identity mapping over the
+        token dictionary is used.
+    MODEL_PATH : str
+        HuggingFace-style directory of the Geneformer checkpoint.
+    PREDIFINED_EMB : torch.Tensor, optional
+        Precomputed embedding table of shape ``[n_cell_types, D]``.  When given,
+        :meth:`forward` can look an embedding up by index instead of running the
+        model, which is how eScreen avoids re-encoding the same five cell lines
+        on every batch.
+    model_version : {'V1', 'V2'}, default 'V1'
+        Selects the maximum sequence length and whether ``<cls>``/``<eos>``
+        special tokens are present.  The paper used V1 (Section 2.3.5).
+    device : str, default 'cpu'
+        Device the wrapper and the embedding table are kept on.
+    """
     
     def __init__(self, TOKEN_DICTIONARY_FILE, GENE_MEDIAN_FILE, ENSEMBL_DICTIONARY_FILE, 
                  ENSEMBL_MAPPING_FILE, MODEL_PATH, PREDIFINED_EMB=None, model_version="V1",device="cpu"):
+        """Load the checkpoint and every auxiliary lookup table.
+
+        Parameters
+        ----------
+        TOKEN_DICTIONARY_FILE, GENE_MEDIAN_FILE : str
+            Pickle files for the gene-to-token map and the per-gene medians.
+        ENSEMBL_DICTIONARY_FILE, ENSEMBL_MAPPING_FILE : str or None
+            Symbol-to-Ensembl map and the Ensembl ID normalisation map.  The
+            latter falls back to an identity map when omitted.
+        MODEL_PATH : str
+            Geneformer checkpoint directory.
+        PREDIFINED_EMB : torch.Tensor, optional
+            Precomputed embedding table, ``[n_cell_types, D]``.
+        model_version : {'V1', 'V2'}, default 'V1'
+            Determines ``MAX_LENGTH`` (2048 for V1, 4096 for V2) and whether
+            ``SPECIAL_TOKEN`` is enabled.  This single flag drives both the
+            truncation logic in :meth:`_tokenize_cell` and the pooling offsets
+            in :meth:`_extract_embedding`, so mixing the two versions silently
+            produces wrong poolings -- hence the explicit validation below.
+        device : str, default 'cpu'
+            Device the wrapper lives on.
+
+        Notes
+        -----
+        The checkpoint is loaded with ``output_hidden_states=True`` and put in
+        ``eval()`` mode immediately: the wrapper is a frozen feature extractor
+        and never trains its own weights.  ``PREDIFINED_EMB`` is only stored
+        when provided; if it is omitted, ``self.PREDIFINED_EMB`` simply does not
+        exist (see the warning in :meth:`forward`).
+        """
 
         # load the model
         model = BertForMaskedLM.from_pretrained(
@@ -440,18 +510,50 @@ class Geneformer(nn.Module):
             self.PREDIFINED_EMB = PREDIFINED_EMB.to(self.device)
 
     def _tokenize_cell(self, expression_list, gene_list, gene_type='DepMap', target_sum=10000):
-        """
-        Convert a single cell's expression data into token IDs
-        Follows the original logic of Geneformer TranscriptomeTokenizer
+        """Convert one cell's expression profile into Geneformer token IDs.
 
-        Args:
-            gene_list: list of str, list of gene names
-            expression_list: list of float, corresponding expression values
-            gene_type: str, 'DepMap' (gene symbol) or 'Ensembl'
-            target_sum: target total for normalization (default 10000)
+        Mirrors ``Geneformer TranscriptomeTokenizer`` step for step, because the
+        pretrained model expects inputs prepared exactly this way.
 
-        Returns:
-            input_ids: list of token IDs, None if there are no valid genes
+        Parameters
+        ----------
+        expression_list : list of float
+            Expression values, one per gene.
+        gene_list : list of str
+            Gene identifiers aligned with ``expression_list``.  Note that the
+            two arguments are in the opposite order to the ``Args:`` block in the
+            original docstring.
+        gene_type : {'DepMap', 'Ensembl'}
+            How to interpret ``gene_list``.  DepMap entries look like
+            ``"TP53 10"`` (symbol plus lineage) or plain ``"TP53"``; Ensembl
+            entries look like ``"ENSG00000141510"`` with an optional
+            ``".11"`` version suffix.
+        target_sum : float, default 10000
+            Counts-per-target normalisation constant; 10,000 matches
+            Section 2.3.5.
+
+        Returns
+        -------
+        list of int or None
+            Token IDs ready for the model.  ``None`` is returned whenever the
+            profile cannot be tokenised at all (no detected genes, no mappable
+            Ensembl IDs, no IDs present in the token dictionary, or zero total
+            counts) so that callers can skip the cell instead of crashing.
+
+        Notes
+        -----
+        The order of operations follows Geneformer and is not arbitrary:
+
+        1. genes with zero expression are dropped before any normalisation, so
+           they cannot dilute the target-sum scaling;
+        2. duplicate Ensembl IDs (possible after symbol collapsing) have their
+           expression **summed**, not averaged;
+        3. expression is scaled to ``target_sum`` and then **divided** by the
+           per-gene median, which removes the gene-specific baseline that would
+           otherwise let highly expressed housekeeping genes dominate;
+        4. tokens are sorted by descending normalised expression rather than by
+           genomic position -- the ranking is the information the model was
+           trained to read.
         """
         # 1. filter out undetected genes (expression > 0)
         # make sure both lists have the same length
@@ -551,22 +653,47 @@ class Geneformer(nn.Module):
         return input_ids
 
     def _extract_embedding(self, input_ids, emb_type='cell', emb_layer=-1, device='cuda'):
-        """
-        Extract embeddings, following the original logic of Geneformer EmbExtractor
+        """Pool Geneformer hidden states into the requested embedding.
 
-        Args:
-            input_ids: list of token IDs
-            emb_type: str, one of 'cell', 'gene', 'cls'
-                      - 'cell': mean-pool the embeddings of all gene tokens
-                      - 'cls': CLS token embedding (V2 only)
-                      - 'gene': return the embedding of each token
-            emb_layer: int, -1: second-to-last layer, 0: last layer
-            device: str, device
+        Follows ``Geneformer EmbExtractor``: the sequence is padded to
+        ``MAX_LENGTH``, run once under ``no_grad``, and the hidden state of a
+        chosen layer is pooled depending on ``emb_type``.
 
-        Returns:
-            emb_type='cell': torch.tensor, shape [hidden_dim]
-            emb_type='cls': torch.tensor, shape [hidden_dim]
-            emb_type='gene': dict, {token_id: embedding_tensor}
+        Parameters
+        ----------
+        input_ids : list of int or None
+            Token IDs from :meth:`_tokenize_cell`.
+        emb_type : {'cell', 'gene', 'cls'}
+            ``'cell'`` mean-pools the gene-token embeddings (the eScreen
+            default, Section 2.3.5); ``'cls'`` returns the ``<cls>`` token
+            (V2 only); ``'gene'`` returns a per-token dictionary.
+        emb_layer : int, default -1
+            Layer selector.  ``-1`` means the penultimate layer, ``0`` the last
+            layer, any other value is used as a direct index into
+            ``hidden_states``.
+        device : str, default 'cuda'
+            Device for the forward pass.  The caller normally passes
+            ``self.device``.
+
+        Returns
+        -------
+        torch.Tensor or dict or None
+            ``[hidden_dim]`` for ``'cell'``/``'cls'``, ``{token_id: tensor}`` for
+            ``'gene'``, or ``None`` when ``input_ids`` is ``None`` or the valid
+            length collapses to zero.
+
+        Notes
+        -----
+        ``hidden_states`` is a tuple of length ``num_layers + 1`` because Hugging
+        Face prepends the embedding-layer output.  That extra entry is why the
+        penultimate *layer* is at index ``len - 2`` and not ``len - 1``; using
+        ``-1`` naively would silently return the final layer instead.
+
+        For V2 the special tokens sit at both ends, so the gene tokens are
+        ``embeddings[0, 1:original_len-1]``.  That slice already contains
+        ``original_len - 2`` entries, making the subsequent ``[:valid_len]``
+        truncation a no-op for V2 -- it is only meaningful for V1, where
+        ``valid_len`` equals ``original_len``.
         """
         if input_ids is None:
             return None
@@ -645,20 +772,36 @@ class Geneformer(nn.Module):
             
     def get_embedding(self, x, z, gene_type='DepMap', target_sum=10000, 
                       emb_type='cell', emb_layer=-1, device='cuda'):
-        """
-        Obtain cell or gene embeddings
-        
-        Args:
-            x: list, expression values
-            z: list, list of gene names
-            gene_type: 'DepMap' (gene symbol) or 'Ensembl'
-            target_sum: target total for normalization
-            emb_type: 'cell', 'gene', 'cls'
-            emb_layer: -1 (second-to-last layer) or 0 (last layer)
-            device: compute device
-        
-        Returns:
-            corresponding embedding
+        """Tokenise one expression profile and return its Geneformer embedding.
+
+        Convenience wrapper that chains :meth:`_tokenize_cell` and
+        :meth:`_extract_embedding`.  This is the entry point used to build the
+        cell-type embedding table consumed by eScreen.
+
+        Parameters
+        ----------
+        x : list of float
+            Expression values for one cell line.
+        z : list of str
+            Gene identifiers aligned with ``x``.
+        gene_type : {'DepMap', 'Ensembl'}, default 'DepMap'
+            Interpret ``z`` as gene symbols (with optional lineage suffix) or as
+            Ensembl IDs.
+        target_sum : float, default 10000
+            Normalisation target; 10,000 as in Section 2.3.5.
+        emb_type : {'cell', 'gene', 'cls'}, default 'cell'
+            Pooling mode; ``'cell'`` is what eScreen needs.
+        emb_layer : int, default -1
+            ``-1`` for the penultimate layer, ``0`` for the last layer.
+        device : str, default 'cuda'
+            Accepted for interface compatibility but **not used** -- the forward
+            pass is routed to ``self.device`` below.
+
+        Returns
+        -------
+        torch.Tensor or dict or None
+            The requested embedding, or ``None`` if the profile could not be
+            tokenised (for example all-zero expression).
         """
         self.model.to(self.device)
         input_ids = self._tokenize_cell(x, z, gene_type=gene_type, target_sum=target_sum)
@@ -672,8 +815,53 @@ class Geneformer(nn.Module):
         )
     
     def forward(self, x, gene_type='DepMap',emb_type='cell', emb_layer=-1):
-        """
-        x is the input: either a tokenized cell line, or [(expression, gene_list), ...]
+        """Return cell-type embeddings, by table lookup or by encoding.
+
+        Serves two distinct input shapes, which is why the signature is
+        polymorphic:
+
+        * ``x`` is an integer ``torch.Tensor`` of cell-type indices -> the
+          precomputed rows of ``PREDIFINED_EMB`` are returned directly.  This is
+          the path eScreen uses during training, where the five cell lines are
+          fixed and re-encoding them every batch would be wasteful.
+        * ``x`` is a list of ``(expression_values, gene_names)`` pairs -> each
+          profile is encoded through Geneformer with
+          :meth:`get_embedding` and the results are stacked.
+
+        Parameters
+        ----------
+        x : torch.Tensor or list of tuple
+            Cell-type indices, or a list of ``(expression, genes)`` pairs.
+        gene_type : {'DepMap', 'Ensembl'}, default 'DepMap'
+            Identifier convention for the gene names, used only on the encoding
+            path.
+        emb_type : {'cell', 'gene', 'cls'}, default 'cell'
+            Pooling mode, used only on the encoding path.
+        emb_layer : int, default -1
+            Layer selector, used only on the encoding path.
+
+        Returns
+        -------
+        torch.Tensor
+            ``[len(x), D]`` embeddings.
+
+        WARNING
+        -------
+        The list-encoding branch is **broken as written**, in three ways:
+
+        1. ``torch.max(x)`` is evaluated *before* the ``isinstance`` guard, so
+           passing a list of tuples raises ``TypeError`` immediately instead of
+           reaching the ``else`` branch.
+        2. That branch calls a bare ``get_embedding(self, ...)``.  No such
+           module-level function exists -- ``get_embedding`` is a method -- so
+           the correct call would be ``self.get_embedding(_x[0], _x[1], ...)``.
+        3. When ``PREDIFINED_EMB`` was not supplied to the constructor, the
+           attribute never exists, so the index path raises ``AttributeError``
+           rather than falling back to encoding.
+
+        The training path avoids all three by always passing a tensor and always
+        providing ``PREDIFINED_EMB``.  Left unchanged because this task only adds
+        documentation.
         """
         if torch.max(x) < len(self.PREDIFINED_EMB) and isinstance(x,torch.Tensor): 
             # if the cell line is in the predefined embeddings and already converted
