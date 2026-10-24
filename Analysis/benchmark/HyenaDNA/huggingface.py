@@ -148,8 +148,7 @@ class HyenaDNAPreTrainedModel(PreTrainedModel):
         initialised weight in place.
 
         When ``download`` is true the destination directory is removed first
-        (``rm -rf`` through a shell), which is destructive - point ``path`` at a
-        scratch directory.
+        (``rm -rf`` through a shell), which is destructive.
         """
         pretrained_model_name_or_path = os.path.join(path, model_name)
         if os.path.isdir(pretrained_model_name_or_path) and download == False:

@@ -51,7 +51,7 @@ Expected on disk
 ``data/hg38.fa``
     hg38 reference genome indexed for :mod:`pyfaidx` (i.e. ``hg38.fa.fai``
     must sit next to it). Only chr1-22, chrX and chrY are loaded. The path is
-    a hard-coded default; adjust before rerunning on another machine.
+    a hard-coded default.
 
 Nothing else is read from disk. AlphaGenome runs behind the hosted API, so
 there is no local checkpoint; the API keys are hard-coded (see the note above
@@ -93,15 +93,12 @@ warnings.filterwarnings('ignore')
 
 
 # ── AlphaGenome API keys + model creation ────────────────────────
-# Hard-coded credentials for the hosted AlphaGenome API. Three separate keys
-# are used so that the WT / MASK / SHUFFLE requests of one batch can run
-# concurrently without sharing a per-key rate limit (see
-# :func:`process_batch_parallel`). These are research credentials committed by
-# the authors; treat them as secrets and replace with your own keys (or an
-# environment variable) before rerunning.
-API_KEY_1 = 'AIzaSyCqc-MYn0DnNcszFh8AjISkgHiiZk8wAUM'
-API_KEY_2 = 'AIzaSyC6jslFT4qt9Tbo0L9Ote7m60U__pP68r8'
-API_KEY_3 = 'AIzaSyC8xemKYuNnzX0nOnG5dpf6e8B_EMeT_Rc'
+# Credentials for the hosted AlphaGenome API. Three separate keys are used so
+# that the WT / MASK / SHUFFLE requests of one batch can run concurrently
+# without sharing a per-key rate limit (see :func:`process_batch_parallel`).
+API_KEY_1 = 'Your API Key'
+API_KEY_2 = 'Your API Key'
+API_KEY_3 = 'Your API Key'
 
 
 def create_models():
@@ -137,7 +134,7 @@ def load_genome(fasta_path='data/hg38.fa'):
     fasta_path : str, optional
         Path to the hg38 FASTA. Must already have a ``.fai`` index (pyfaidx
         builds one on first access if the file is writable). Hard-coded
-        default ``data/hg38.fa``; adjust before rerunning elsewhere.
+        default ``data/hg38.fa``.
 
     Returns
     -------

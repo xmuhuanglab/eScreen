@@ -24,7 +24,7 @@ by the benchmark scripts in the sibling directories.
 Expected on disk
 ----------------
 Inputs. Absolute paths below are hard-coded for the authors' Linux
-cluster -- adjust before rerunning anywhere else:
+cluster:
 
 * ``BACKBONE_CKPT`` -- pretrained PWM backbone checkpoint
   (``backbone_20260427_pwm_29.pth``), loaded with ``strict=False``.

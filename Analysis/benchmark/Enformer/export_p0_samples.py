@@ -36,8 +36,7 @@ Where it differs from the manuscript
 
 Expected on disk
 ----------------
-Input (hard-coded absolute path, Clustered filesystem; adjust before rerunning
-anywhere else)::
+Input (hard-coded absolute path on the Clustered filesystem)::
 
     /cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/
         TestData_20260509.randomCRE.4.pkl

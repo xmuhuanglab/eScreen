@@ -145,7 +145,7 @@ def init_model():
       ``conv``/``emb`` branches that consume it.
     * ``load_state_dict(..., strict=False)`` tolerates missing and extra keys
       silently, so a mismatched checkpoint degrades to partly random weights with
-      no warning.  Inspect the returned ``_IncompatibleKeys`` if that matters.
+      no warning.
     * All ``freeze_*`` flags are False, so the loaded model stays fully trainable:
       right for the Train tab, slower than a frozen encoder for pure inference.
     * ``DEVICE`` is chosen here, not by the caller, and is returned so the rest of

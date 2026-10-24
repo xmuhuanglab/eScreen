@@ -26,7 +26,7 @@ Expected on disk
 ----------------
 Inputs::
 
-    # Hard-coded absolute path on the authors' cluster (adjust before rerunning);
+    # Hard-coded absolute path on the authors' cluster;
     # only the (cell_line, label) columns and the row index are needed.
     /cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/
         TestData_20260509.randomCRE.4.pkl

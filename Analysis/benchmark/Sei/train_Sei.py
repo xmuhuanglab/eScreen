@@ -303,9 +303,9 @@ def pad_to_4096(seq_np):
     if l > 4096:
         start = (l - 4096) // 2
         return seq_np[:, start:start + 4096, :]
-        # Symmetric centre padding, following the same convention §6.2.5 reports
-        # for the DeepSEA baseline (512 -> 4,096 bp). ``pad_right`` takes the odd
-        # base so that the original window stays centred.
+    # Symmetric centre padding, following the same convention §6.2.5 reports
+    # for the DeepSEA baseline (512 -> 4,096 bp). ``pad_right`` takes the odd
+    # base so that the original window stays centred.
     pad_total = 4096 - l
     pad_left = pad_total // 2
     pad_right = pad_total - pad_left
