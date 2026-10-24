@@ -63,7 +63,7 @@ import pandas as pd
 warnings.filterwarnings('ignore')
 
 # ── Paths & Constants ──
-# Hard-coded cluster path; see the module docstring. The pickle predates
+# Placeholder path; see the module docstring. The pickle predates
 # numpy 2.0, hence _NumpyCompatUnpickler below.
 ORIGINAL_PATH = "/path/to/eScreen_training/datasets/TestData_20260509.randomCRE.4.pkl"
 # The five cell lines of the eScreen benchmark ("P0" freeze).

@@ -1070,7 +1070,7 @@ def draw_loci_context(loci):
 
     Notes
     -----
-    * Tracks are hard-coded to ``/path/to/data/K562/*.bigWig``:
+    * Tracks are read from ``/path/to/data/K562/*.bigWig``:
       DNase, ATAC, H3K27ac, H3K4me3, CTCF, H3K27me3 - the marks used for the
       peak nodes of the eScreen-local graph
       (Supplementary Methods section 2.4.2).
@@ -1083,8 +1083,7 @@ def draw_loci_context(loci):
     """
     chrchr=loci[0];startstart=loci[1];endend=loci[2]
 
-    # Hard-coded K562 tracks from the lab cluster: the six marks behind the peak
-    # nodes and the genome-context panels.
+    # K562 tracks behind the peak nodes and the genome-context panels.
     bw=pyBigWig.open('/path/to/data/K562/DNase.bigWig')
     dnase_array=np.array(bw.values(chrchr,startstart,endend))
     bw.close()
@@ -1168,8 +1167,8 @@ def draw_loci_context_ax(loci,feature=[],figsize=(5,3)):
     startstart = loci[1]
     endend = loci[2]
 
-    # Mark name -> BigWig file stem; the directory is hard-coded to the lab
-    # cluster.
+    # Mark name -> BigWig file stem; the containing directory is a
+    # placeholder constant.
     epi_key_dict={'dnase':'DNase','atac':'ATAC',
                   'k27ac':'H3K27ac','k4me3':'H3K4me3',
                   'k27me3':'H3K27me3','k9me3':'H3K9me3',

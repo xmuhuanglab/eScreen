@@ -214,7 +214,7 @@ def get_unique_cre_data():
     Parameters
     ----------
     None
-        All paths come from module-level constants (hard-coded cluster paths).
+        All paths come from module-level placeholder constants.
 
     Returns
     -------

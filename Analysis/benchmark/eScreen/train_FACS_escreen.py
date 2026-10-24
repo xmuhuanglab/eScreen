@@ -31,7 +31,7 @@ Inputs. The absolute paths below are placeholders:
   filters, padded to a maximum motif width of 35.
 * FACS sequences/labels via ``load_facs_for_cell_line`` from the helper
   module ``load_facs_data``. That module is *not* shipped in this
-  checkout; it is resolved from the cluster path pushed onto ``sys.path``.
+  checkout; it is resolved from the placeholder path pushed onto ``sys.path``.
   Upstream, labels follow §5.5: activity is the tRRA score and a CRE is
   positive when tRRA > 2.
 
@@ -93,11 +93,11 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 
 # Import roots. The first entry, ``../_shared``, does **not** exist in this
-# checkout: the shared dataset/metric helpers were kept on the cluster, so
-# ``load_facs_data`` and ``motif`` come from the absolute paths below. The
-# two cluster entries are hard-coded. They also decide which ``escreen`` package wins: with the
-# cluster directory first on the path, ``from escreen import ...`` picks
-# the cluster copy, not ``D:\GitHub\eScreen\escreen``. When both are
+# checkout: the shared dataset/metric helpers were kept outside the
+# repository, so ``load_facs_data`` and ``motif`` come from the placeholder
+# paths below. Those entries also decide which ``escreen`` package wins: with
+# the placeholder directory first on the path, ``from escreen import ...``
+# picks that copy, not ``D:\GitHub\eScreen\escreen``. When both are
 # importable the repository package is the authoritative one.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '_shared'))
 sys.path.insert(0, '/path/to/eScreen/code/')
@@ -108,7 +108,7 @@ from motif import load_pwm_from_meme_c
 from load_facs_data import load_facs_for_cell_line
 
 # ── Paths ──
-# Hard-coded absolute paths (cluster-specific).
+# Placeholder absolute paths.
 # ``BACKBONE_CKPT`` holds the distilled/pretrained PWM backbone -- the
 # eScreen encoder of §2.1; ``MEME_PATH`` supplies the fixed PWM input layer.
 BACKBONE_CKPT = '/path/to/eScreen/202604_rebuttal/model_weights/backbone_20260427_pwm_29.pth'
