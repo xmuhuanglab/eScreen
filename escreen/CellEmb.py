@@ -860,8 +860,7 @@ class Geneformer(nn.Module):
            rather than falling back to encoding.
 
         The training path avoids all three by always passing a tensor and always
-        providing ``PREDIFINED_EMB``.  Left unchanged because this task only adds
-        documentation.
+        providing ``PREDIFINED_EMB``.
         """
         if torch.max(x) < len(self.PREDIFINED_EMB) and isinstance(x,torch.Tensor): 
             # if the cell line is in the predefined embeddings and already converted

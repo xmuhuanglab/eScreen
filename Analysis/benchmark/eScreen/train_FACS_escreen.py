@@ -96,8 +96,7 @@ from torch.optim import AdamW
 # Import roots. The first entry, ``../_shared``, does **not** exist in this
 # checkout: the shared dataset/metric helpers were kept on the cluster, so
 # ``load_facs_data`` and ``motif`` come from the absolute paths below. The
-# two cluster entries are hard-coded and must be edited before rerunning
-# elsewhere. They also decide which ``escreen`` package wins: with the
+# two cluster entries are hard-coded. They also decide which ``escreen`` package wins: with the
 # cluster directory first on the path, ``from escreen import ...`` picks
 # the cluster copy, not ``D:\GitHub\eScreen\escreen``. When both are
 # importable the repository package is the authoritative one.
@@ -110,7 +109,7 @@ from motif import load_pwm_from_meme_c
 from load_facs_data import load_facs_for_cell_line
 
 # ── Paths ──
-# Hard-coded absolute paths (cluster-specific; adjust before rerunning).
+# Hard-coded absolute paths (cluster-specific).
 # ``BACKBONE_CKPT`` holds the distilled/pretrained PWM backbone -- the
 # eScreen encoder of §2.1; ``MEME_PATH`` supplies the fixed PWM input layer.
 BACKBONE_CKPT = '/cluster2/huanglab/liquan/data/eSCREEN/202604_rebuttal/model_weights/backbone_20260427_pwm_29.pth'

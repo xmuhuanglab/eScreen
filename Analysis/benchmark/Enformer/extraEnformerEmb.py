@@ -49,19 +49,18 @@ genomic-block variant 262,144 bp on each side. Neither number appears here: the
 code uses Enformer's native receptive field, 393,216 bp total, arranged as
 ``139,264 | 114,688 | 139,264`` so that the patch is exactly the model's centred
 bin grid. The manuscript's numbers are not reachable with this bin geometry, so
-treat the paper's flank sizes as describing a different (earlier) run.
+the paper's flank sizes describe a different (earlier) run.
 
 Also note that this script does **not** read the P0-filtered CSV produced by
 ``export_p0_samples.py``. It re-derives the same sample filter from the original
 pickle (``RRA < 0.5``, shared across >= 2 cell lines, the five P0 lines) and then
 replaces the 7:2:1 identifier-level split with its own patch/block split. The two
-ways of building the benchmark therefore have to be kept in sync by hand: change
-the filter in one script and the sample counts will silently diverge.
+ways of building the benchmark are therefore independent, and the sample counts
+can diverge silently.
 
 Expected on disk
 ----------------
-Inputs (all hard-coded absolute paths on the authors' cluster; adjust before
-rerunning anywhere else)::
+Inputs (all hard-coded absolute paths on the authors' cluster)::
 
     /cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/
         TestData_20260509.randomCRE.4.pkl      # 8-tuple eScreen bundle

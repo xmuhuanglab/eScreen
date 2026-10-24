@@ -149,8 +149,7 @@ def capture_summit(data, summit_ref, bw_dict,
     * ``catch_epi`` is neither imported in this module nor called with the
       3-element ``(chrom, start, end)`` tuple it expects, so as written this
       raises ``NameError`` (or ``IndexError`` if the symbol is injected).  The
-      intended semantics are the per-offset ratio documented above; the code is
-      left unchanged deliberately.
+      intended semantics are the per-offset ratio documented above.
     * ``kmer`` is only an offset, not a motif length: single bases are sampled,
       not k-mers.
     """
@@ -243,9 +242,9 @@ def get_value(data,bw,feature='profile',threshold=0.5,_filter_=True,_verbose_=Tr
                 # single repeated value (an all-zero stretch, a masked region, ...).
                 element_counts = Counter(array)
                 most_common_element, most_common_count = element_counts.most_common(1)[0]
-                # NOTE (documented, not fixed): the second disjunct makes this
-                # True for every non-empty selection, so 'ok' effectively only
-                # marks rows whose BigWig query failed.
+                # The second disjunct makes this True for every non-empty
+                # selection, so 'ok' effectively only marks rows whose BigWig
+                # query failed.
                 ok_array.append( (most_common_count <= (b - a) *threshold) | (most_common_count !=0 ) )
             except:
                 # Failed query: substitute a 200-bp zero vector regardless of

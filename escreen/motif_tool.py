@@ -120,9 +120,9 @@ def parse_meme_file(file_path):
                 letter_prob_matrix.append(row)
             current_motif["letter_prob_matrix"] = np.array(letter_prob_matrix)
             current_motif["width"] = len(letter_prob_matrix)
-            # NOTE (documented, not fixed): this divides the PWM by its WIDTH,
-            # not by a per-position normaliser, so the stored values are p / w
-            # and the scale depends on the motif length.
+            # This divides the PWM by its WIDTH, not by a per-position
+            # normaliser, so the stored values are p / w and the scale depends
+            # on the motif length.
             current_motif["letter_prob_matrix"] /= current_motif["width"]
             # Pad short motifs at the tail so that all PWMs share a height of
             # 29 bp and can be stacked.  Motifs of 29 bp or more are left

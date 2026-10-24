@@ -110,13 +110,12 @@ def build_hyenadna(model_name='tiny-1k-d256', device='cpu'):
     Notes
     -----
     The checkpoint directory is hard-coded to an absolute cluster path
-    (``/cluster2/huanglab/...``); change it before running elsewhere.
+    (``/cluster2/huanglab/...``).
 
     The saved state dict is prefixed with ``model.``, so that prefix is
     stripped before loading.  ``strict=False`` tolerates any remaining key
     mismatch, which means a partially incompatible checkpoint loads silently
-    with some weights left at their initial values - verify the load if the
-    resulting AUROC looks like chance.
+    with some weights left at their initial values.
     """
     model_path = f'/cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/HyenaDNA/pretrained_model/{model_name}/'
     with open(model_path + 'config.json', 'r') as f:
