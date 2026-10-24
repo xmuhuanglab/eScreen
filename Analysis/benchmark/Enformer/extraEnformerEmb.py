@@ -696,6 +696,37 @@ def worker(gpu_id, cre_info_path, memmap_path, n_total):
 # ══════════════════════════════════════════════════════════
 
 def main():
+    """Coordinate the extraction: build metadata, allocate the memmap, run one worker.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Steps, in order (each has a side effect on disk):
+
+    1. Rebuild the P0-filtered unique-CRE pool from the original pickle
+       (:func:`get_unique_cre_data`).
+    2. Split it spatially into train/valid/test (:func:`create_patch_split`) and
+       map every *sample* to its split label. Samples inherit their CRE's split,
+       so a CRE seen in three cell lines yields three rows with the same label.
+    3. Write the metadata: ``cre_info.npy`` (unique CREs, with the memmap row
+       index), ``cre_to_emb_idx.pkl``, ``sample_cre_ids.npy``, ``sample_split.npy``
+       and ``unique_cre_split.npy``.
+    4. Pre-allocate the ``float32`` memmap with ``mode='w+'`` — this truncates any
+       previous extraction, so a re-run always starts from scratch.
+    5. Spawn ``sys.executable __file__ --worker --gpu 1 ...`` and wait. GPU 1 is
+       **hard-coded** in the command line; the ``--gpu`` default (0) is only used
+       if the script is invoked in worker mode by hand.
+
+    The parent blocks on ``p.wait()`` and propagates a non-zero worker exit code,
+    so a TensorFlow failure surfaces as a script failure rather than as a silently
+    half-filled memmap.
+
+    ``sample_split`` is computed but only ever saved, never used in-process; it is
+    the contract between this script and ``train_enformer_emb_new.py``.
+    """
     parser = argparse.ArgumentParser(
         description='Extract Enformer trunk embeddings (patch-based)')
     parser.add_argument('--worker', action='store_true',
