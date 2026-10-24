@@ -319,7 +319,39 @@ def prepare_sequences_fast(batch_rows, hg38, chrom_len):
 
 
 def predict_single_model(model, sequences, ontology_term, max_workers):
-    """CAGE prediction wrapper for a single model"""
+    """CAGE prediction wrapper for a single model
+
+    Runs one AlphaGenome request over a list of DNA sequences, requesting only
+    the CAGE output head for a single cell-type ontology term.
+
+    Parameters
+    ----------
+    model : alphagenome.models.dna_client.DnaClient
+        One of the clients returned by :func:`create_models`.
+    sequences : list of str
+        DNA sequences of exactly 1,048,576 bp each (ACGT plus ``N``).
+    ontology_term : str
+        Ontology accession for the target cell type, e.g. ``'EFO:0002067'``
+        for K562 (see :data:`ONTOLOGY_TERM`).
+    max_workers : int
+        Number of threads the client may use to parallelise the *internal*
+        inference across sequences. Callers pass ``len(sequences)``.
+
+    Returns
+    -------
+    list
+        One prediction object per input sequence. ``result[i].cage.values`` is
+        a ``(n_bins, n_tracks)`` array of CAGE signal; downstream code sums it
+        over both axes (see :func:`process_batch_parallel`).
+
+    Notes
+    -----
+    Only CAGE is requested. Supplementary Methods §6.2.2 describes the
+    perturbation as being read out on the RNA-seq tracks, whereas the released
+    AlphaGenome API path used here reads the CAGE head; §5.5 describes the CAGE
+    readout. The code follows §5.5 — see the module docstring warning in
+    ``run_escreen_perturbation.py``.
+    """
     return model.predict_sequences(
         sequences=sequences,
         requested_outputs=[OutputType.CAGE],
@@ -333,6 +365,38 @@ def process_batch_parallel(model1, model2, model3, batch_rows, hg38, chrom_len):
     """
     Run 3-model parallel prediction for one batch.
     Returns [(sample_id, wt_cage, mask_cage, shuffle_cage, row), ...]
+
+    Parameters
+    ----------
+    model1, model2, model3 : DnaClient
+        Clients bound to three distinct API keys; model1 handles WT, model2
+        MASK, model3 SHUFFLE.
+    batch_rows : pandas.DataFrame
+        One batch of CRE rows (see :func:`prepare_sequences_fast`).
+    hg38 : pyfaidx.Fasta
+        Indexed reference genome.
+    chrom_len : dict of str to int
+        Chromosome lengths.
+
+    Returns
+    -------
+    list of tuple
+        ``(sample_id, wt_cage, mask_cage, shuffle_cage, row)`` per sample,
+        where ``sample_id`` is ``"{id}@{cell_line}"``, each ``*_cage`` is a
+        ``float16`` vector of per-bin CAGE signal (CAGE values summed across
+        tracks), and ``row`` is the original ``pandas.Series``.
+
+    Notes
+    -----
+    * The three ``executor.submit`` calls are plain threads: the work is I/O
+      bound (HTTP to the hosted API), so the GIL is not a bottleneck, and this
+      keeps the three requests in flight simultaneously.
+    * CAGE tracks are summed with ``.sum(axis=1)``, i.e. collapsed over tracks
+      but *kept per output bin*. The perturbation score is a later reduction
+      over bins (``sum(WT - ALT)``) done by the analysis scripts, not here.
+    * Values are cast to ``float16`` purely to halve the HDF5 footprint; the
+      losses (~1e-3 relative) are irrelevant next to the WT-vs-perturbed
+      differences being scored.
     """
     wt_seqs, mask_seqs, shuffle_seqs, cell_line = prepare_sequences_fast(batch_rows, hg38, chrom_len)
     ontology_term = ONTOLOGY_TERM[cell_line]
@@ -360,7 +424,37 @@ def process_batch_parallel(model1, model2, model3, batch_rows, hg38, chrom_len):
 
 # ── Checkpoint / resume management ───────────────────────────────
 class CheckpointManager:
-    """Checkpoint management for resume (pickle: processed/failed index sets)"""
+    """Checkpoint management for resume (pickle: processed/failed index sets)
+
+    Tracks which row indices of the input CRE table have already been written to
+    the output HDF5, so that a long API run can be interrupted and resumed.
+
+    Parameters
+    ----------
+    checkpoint_file : str, optional
+        Path of the pickle used to persist the two index sets. The file is
+        removed by :meth:`cleanup` once every sample is done.
+
+    Attributes
+    ----------
+    processed : set of int
+        Indices already saved to HDF5.
+    failed : set of int
+        Indices whose batch raised; retried first by
+        :meth:`get_pending_indices`.
+
+    Notes
+    -----
+    Indices are positions into the CRE table (``range(len(cre_df))``), so the
+    checkpoint is only valid together with the exact input table it was created
+    from. The HDF5 file remains the source of truth: the runner re-syncs
+    ``processed`` from the groups already present, so a stale or deleted pickle
+    only costs re-checking, not duplicate work.
+
+    Saves are throttled: :meth:`mark_processed` flushes every 100 samples, while
+    :meth:`mark_failed` flushes immediately (failures are rare and worth
+    persisting).
+    """
 
     def __init__(self, checkpoint_file='checkpoint.pkl'):
         self.checkpoint_file = checkpoint_file
@@ -369,6 +463,7 @@ class CheckpointManager:
         self.load()
 
     def load(self):
+        """Read the pickle if present, silently starting fresh if it is unreadable."""
         if os.path.exists(self.checkpoint_file):
             try:
                 with open(self.checkpoint_file, 'rb') as f:
@@ -381,6 +476,7 @@ class CheckpointManager:
                 print("Failed to load checkpoint, starting fresh")
 
     def save(self):
+        """Serialise both index sets to :attr:`checkpoint_file`."""
         with open(self.checkpoint_file, 'wb') as f:
             pickle.dump({
                 'processed': self.processed,
@@ -388,6 +484,18 @@ class CheckpointManager:
             }, f)
 
     def mark_processed(self, idx):
+        """Record one successfully written sample and flush every 100 samples.
+
+        Parameters
+        ----------
+        idx : int
+            Row index into the CRE table.
+
+        Notes
+        -----
+        A sample that previously failed is removed from ``failed`` here, so a
+        successful retry stops being scheduled.
+        """
         self.processed.add(idx)
         self.failed.discard(idx)
         # save every 100 samples
@@ -395,11 +503,32 @@ class CheckpointManager:
             self.save()
 
     def mark_failed(self, idx):
+        """Record one sample whose batch raised, and flush immediately.
+
+        Parameters
+        ----------
+        idx : int
+            Row index into the CRE table.
+        """
         self.failed.add(idx)
         self.save()
 
     def get_pending_indices(self, total_indices):
-        """Pending indices (previously failed ones first)"""
+        """Pending indices (previously failed ones first)
+
+        Parameters
+        ----------
+        total_indices : int
+            Size of the input CRE table, i.e. ``len(cre_df)``.
+
+        Returns
+        -------
+        list of int
+            Indices not yet processed, with the previously failed subset moved
+            to the front so that a resumed run retries the problematic samples
+            while the GPU/API quota is still warm. Order within each subset is
+            ``set`` order and therefore not reproducible.
+        """
         all_indices = set(range(total_indices))
         pending = all_indices - self.processed
         failed_pending = self.failed & pending
@@ -407,19 +536,54 @@ class CheckpointManager:
         return list(failed_pending) + list(other_pending)
 
     def clear_failed(self):
+        """Forget all failed indices (useful before a manual re-run of a bad batch)."""
         self.failed.clear()
         self.save()
 
     def cleanup(self, total_samples):
-        """Remove the checkpoint file when everything is done"""
+        """Remove the checkpoint file when everything is done
+
+        Parameters
+        ----------
+        total_samples : int
+            Expected number of samples; the file is only deleted when
+            ``len(processed) == total_samples`` so that an interrupted run keeps
+            its progress record.
+
+        Notes
+        -----
+        Deletion can fail on Windows if the HDF5 file handle is still open or
+        the pickle is locked by another process; there is no retry here.
+        """
         if len(self.processed) == total_samples and os.path.exists(self.checkpoint_file):
             os.remove(self.checkpoint_file)
             print('Checkpoint removed')
 
 
 # ── String perturbation utilities (windowed operations) ──────────
+# Generic, in-memory equivalents of the operations applied by
+# prepare_sequences_fast. They operate on an arbitrary string (normally a 1 Mb
+# DNA sequence) and on window offsets relative to that string. All bounds are
+# clamped, so callers may pass windows that run past either end. They are kept
+# for ad-hoc/interactive use; the batched runner path uses the faster list-based
+# code in prepare_sequences_fast instead.
 def mask_in_window(original_str: str, start: int, end: int) -> str:
-    """Replace all characters in the given window with 'N'."""
+    """Replace all characters in the given window with 'N'.
+
+    Parameters
+    ----------
+    original_str : str
+        Sequence to modify.
+    start, end : int
+        0-based, half-open window offsets into ``original_str``; clamped to the
+        valid range.
+
+    Returns
+    -------
+    str
+        A new string of the same length. The input is never modified in place,
+        and an empty input is returned unchanged.
+    """
     if not original_str:
         return original_str
     chars = list(original_str)
@@ -432,7 +596,34 @@ def mask_in_window(original_str: str, start: int, end: int) -> str:
 
 def replace_in_window(original_str: str, start: int, end: int,
                       target_char: str, replacement_char: str) -> str:
-    """Replace target characters with replacement characters in the window."""
+    """Replace target characters with replacement characters in the window.
+
+    Parameters
+    ----------
+    original_str : str
+        Sequence to modify.
+    start, end : int
+        0-based, half-open window offsets; clamped to the string bounds.
+    target_char : str
+        Single character to look for, e.g. ``'N'``.
+    replacement_char : str
+        Single character to substitute, e.g. ``'A'``.
+
+    Returns
+    -------
+    str
+        New string of the same length.
+
+    Raises
+    ------
+    ValueError
+        If either character argument is not exactly one character long.
+
+    Notes
+    -----
+    Only exact character matches inside the window are touched; positions that
+    fall outside ``[start, end)`` are copied through untouched.
+    """
     if not original_str:
         return original_str
     if len(target_char) != 1 or len(replacement_char) != 1:
@@ -447,7 +638,38 @@ def replace_in_window(original_str: str, start: int, end: int,
 
 
 def shuffle_in_window(original_str: str, start: int, end: int, seed=114514) -> str:
-    """Randomly shuffle the characters in the given window."""
+    """Randomly shuffle the characters in the given window.
+
+    Parameters
+    ----------
+    original_str : str
+        Sequence to modify.
+    start, end : int
+        0-based, half-open window offsets; clamped to the string bounds.
+    seed : int, optional
+        Seed for :func:`random.seed`. Default ``114514`` is the project-wide
+        seed used by the shuffling perturbation, so the same input window always
+        yields the same shuffled sequence.
+
+    Returns
+    -------
+    str
+        New string of the same length with the window's characters permuted.
+
+    Notes
+    -----
+    This permutes bases within the window only — it preserves the window's base
+    composition, which is what makes the shuffling control in Supplementary
+    Methods §6.2.2 different from N-masking: the mask removes all information,
+    the shuffle preserves mononucleotide content (and hence most simple
+    k-mer-composition effects) while destroying motif order.
+
+    A window of length <= 1 (or an inverted/empty interval) is returned
+    unchanged, since shuffling it is a no-op.
+
+    Uses Python's global :mod:`random` state; callers in a multithreaded context
+    would need to serialise access.
+    """
     if not original_str:
         return original_str
     actual_start = max(0, start)
@@ -463,7 +685,42 @@ def shuffle_in_window(original_str: str, start: int, end: int, seed=114514) -> s
 
 
 # ── Evaluation metric functions ──────────────────────────────────
+# Metrics follow Supplementary Methods §7.1 (AUROC / AUPRC for the CRISPR
+# benchmark) and the m2a composite used for checkpoint selection in §5.5.
 def z_norm(header: dict, values: np.ndarray) -> np.ndarray:
+    """Z-normalise per-bin signal using bigWig summary statistics.
+
+    Parameters
+    ----------
+    header : dict
+        Summary statistics for the track: ``"sumData"``, ``"sumSquared"`` and
+        ``"nBasesCovered"`` (the fields returned by
+        ``pyBigWig.stats(..., type="summary")``).
+    values : numpy.ndarray
+        Raw signal values to normalise, any shape.
+
+    Returns
+    -------
+    numpy.ndarray
+        ``(values - mean) / std`` computed from the header, same shape as
+        ``values``.
+
+    Raises
+    ------
+    ValueError
+        If a required header key is missing, ``nBasesCovered == 0``, or the
+        standard deviation is exactly 0 (constant track).
+
+    Notes
+    -----
+    The variance is clamped at 0 with ``max(...)`` before the square root: for a
+    constant track ``mean_sq - mean**2`` can be a tiny negative number in
+    floating point, and ``np.sqrt`` of that is ``nan``.
+
+    Not used by the current AlphaGenome scoring path (the perturbation score is
+    a raw difference of CAGE sums); it is a shared utility for track-normalised
+    comparisons elsewhere in the analysis notebooks.
+    """
     required_keys = {"sumData", "sumSquared", "nBasesCovered"}
     if not required_keys.issubset(header.keys()):
         raise ValueError(f"Header must contain keys: {required_keys}")
@@ -480,11 +737,73 @@ def z_norm(header: dict, values: np.ndarray) -> np.ndarray:
 
 
 def Logistic_norm(x, px=[0, 2.0, 4.0, 6.0], py=[0.0, 0.5, 0.8, 1.0]):
+    """Map raw tRRA activity scores onto the [0, 1] label range.
+
+    This is the nonlinear label transform of Supplementary Methods §2.3.2
+    (``def Logistic_norm(x, px=[0, 2.0, 4.0, 6.0], py=[0.0, 0.5, 0.8, 1.0])``).
+
+    Parameters
+    ----------
+    x : array_like
+        Raw tRRA values (``-log10`` MAGeCK RRA). Values outside ``px`` are
+        clamped by the interpolator.
+    px : list of float, optional
+        Abscissae of the control points: tRRA 0, 2, 4 and 6 — i.e. RRA 1, 1e-2,
+        1e-4 and 1e-6, matching the tRRA > 2 threshold that defines a functional
+        CRE (§1.4).
+    py : list of float, optional
+        Ordinates at those control points: 0.0, 0.5, 0.8 and 1.0.
+
+    Returns
+    -------
+    numpy.ndarray
+        Activity labels in approximately [0, 1], same shape as ``x``.
+
+    Notes
+    -----
+    * PCHIP (monotone piecewise cubic Hermite) interpolation is used rather than
+      a logistic function despite the name: it interpolates the control points
+      exactly and cannot overshoot, so the output never leaves [0, 1].
+    * Not to be confused with the sigmoid-based *sigmoid normalisation* of
+      gRNA LFC values described in Supplementary Methods §1.3; that one happens
+      upstream, on gRNA LFCs, not here on CRE-level tRRA.
+    * ``Logistic_norm`` is applied to labels, not predictions; models are trained
+      with a smooth-L1 loss against these values plus an auxiliary BCE term
+      (§2.3.2, §5.5).
+    """
     x = np.asarray(x)
     return PchipInterpolator(px, py)(x)
 
 
 def build_label_boost_weights(labels, target_pos_mass=0.55):
+    """Per-sample weights that give the positive class a fixed share of the total mass.
+
+    Implements the weighting side of the label-boosted sampler used for the
+    eScreen benchmark training (Supplementary Methods §2.3.4 and §5.5, "target
+    positive class mass fraction of 0.55", temperature 0.45 applied separately
+    by the sampler).
+
+    Parameters
+    ----------
+    labels : array_like
+        Binary labels (0/1) or scores thresholded at 0.5.
+    target_pos_mass : float, optional
+        Desired total weight of the positive class, default 0.55.
+
+    Returns
+    -------
+    numpy.ndarray
+        Weights of shape ``(n,)`` summing to 1, with all positives sharing
+        ``target_pos_mass`` and all negatives sharing ``1 - target_pos_mass``.
+
+    Notes
+    -----
+    * This rewrites class prior only; it does not resample. The sampler used at
+      training time dirties this further with a temperature exponent.
+    * Epsilon guards: counts are floored at 1 so an all-positive or
+      all-negative batch cannot divide by zero, and the final normalisation uses
+      ``max(w.sum(), 1e-12)`` for the degenerate all-zero case.
+    """
     y = np.asarray(labels, dtype=float)
     pos = y > 0.5
     n_pos = max(pos.sum(), 1)
@@ -494,6 +813,33 @@ def build_label_boost_weights(labels, target_pos_mass=0.55):
 
 
 def median_auroc(pred, y_true, groups):
+    """Median of per-group AUROC, skipping groups that cannot be scored.
+
+    Parameters
+    ----------
+    pred : array_like
+        Continuous scores (higher = more likely positive), shape ``(n,)``.
+    y_true : array_like
+        Binary labels, shape ``(n,)``.
+    groups : array_like
+        Group label per sample, normally the cell line, shape ``(n,)``.
+
+    Returns
+    -------
+    float
+        Median AUROC across groups, or ``nan`` if no group was scoreable.
+
+    Notes
+    -----
+    A group is skipped when it has fewer than 2 samples *or* only one distinct
+    label — ``roc_auc_score`` raises in both cases, and silently omitting the
+    group is the convention used for the per-cell-line benchmark tables
+    (Supplementary Methods §6.1 reports per-cell-line AUROC).
+
+    The median (rather than the mean) is used because the number of CREs differs
+    substantially between cell lines; it is also the first term of the m2a
+    composite score.
+    """
     y_true = np.asarray(y_true, dtype=float)
     pred = np.asarray(pred, dtype=float)
     groups = np.asarray(groups)
@@ -509,6 +855,32 @@ def median_auroc(pred, y_true, groups):
 
 
 def median_auprc(pred, y_true, groups):
+    """Median of per-group AUPRC (area under the precision-recall curve).
+
+    Parameters
+    ----------
+    pred : array_like
+        Continuous scores, shape ``(n,)``.
+    y_true : array_like
+        Binary labels, shape ``(n,)``.
+    groups : array_like
+        Group label per sample (cell line), shape ``(n,)``.
+
+    Returns
+    -------
+    float
+        Median AUPRC across groups, or ``nan`` if there were no groups.
+
+    Notes
+    -----
+    * Unlike :func:`median_auroc`, groups are only skipped when they hold fewer
+      than 2 samples: ``precision_recall_curve`` tolerates a single-class group,
+      and dropping such groups would bias the median.
+    * ``auc(rec, prec)`` is used rather than ``average_precision_score`` so that
+      the number matches the trapezoidal AUPRC reported in the manuscript
+      tables; ``sklearn.metrics.auc`` auto-detects that recall is decreasing and
+      flips the sign, so the integral comes out positive.
+    """
     y_true = np.asarray(y_true, dtype=float)
     pred = np.asarray(pred, dtype=float)
     groups = np.asarray(groups)
@@ -525,13 +897,70 @@ def median_auprc(pred, y_true, groups):
 
 
 def m2a_combo_score(pred, y_true, groups):
-    """m2a_combo = 0.7 x median_AUROC + 0.3 x median_AUPRC"""
+    """m2a_combo = 0.7 x median_AUROC + 0.3 x median_AUPRC
+
+    The composite model-selection score of Supplementary Methods §5.5: the best
+    checkpoint is chosen by the m2a composite score rather than by a single
+    metric, so a model cannot win by trading AUROC against AUPRC.
+
+    Parameters
+    ----------
+    pred : array_like
+        Continuous scores, shape ``(n,)``.
+    y_true : array_like
+        Binary labels, shape ``(n,)``.
+    groups : array_like
+        Cell-line label per sample, shape ``(n,)``.
+
+    Returns
+    -------
+    float
+        The weighted composite, or ``nan`` if the AUROC median is ``nan``.
+
+    Notes
+    -----
+    * The 0.7/0.3 weighting is asymmetric on purpose: AUROC is the primary
+      benchmark metric in Supplementary Methods §6.1, AUPRC is the tie-breaker
+      that penalises poor ranking of the minority (active) class.
+    * This returns a **scalar**. Callers that unpack it into two values (see
+      ``analyze_facs_scores.py``, which does
+      ``combo, results = m2a_combo_score(...)``) are broken against this
+      signature; that script predates the change to a scalar return.
+    """
     ma = median_auroc(pred, y_true, groups)
     mp = median_auprc(pred, y_true, groups)
     return 0.7 * ma + 0.3 * mp
 
 
 def per_cell_line_metrics(pred, y_true, groups):
+    """Compute AUROC and AUPRC separately for every group (cell line).
+
+    Parameters
+    ----------
+    pred : array_like
+        Continuous scores, shape ``(n,)``.
+    y_true : array_like
+        Binary labels, shape ``(n,)``.
+    groups : array_like
+        Group label per sample, shape ``(n,)``.
+
+    Returns
+    -------
+    list of dict
+        One entry per scoreable group with keys ``'cell_line'``, ``'AUROC'``,
+        ``'AUPRC'``, ``'n_pos'``, ``'n_neg'``. Groups containing only one class
+        are omitted, since both metrics are undefined there.
+
+    Notes
+    -----
+    ``pred`` is expected to be already monotone-transformed (e.g. passed through
+    a sigmoid); both metrics are rank based, so the transform does not matter
+    for the values, but it keeps the API consistent with the scripts that feed
+    probabilities.
+
+    The returned list is consumed by :func:`print_metrics` and by the
+    checkpoint-selection loops in the training scripts.
+    """
     results = []
     for g in np.unique(groups):
         idx = np.where(groups == g)[0]
@@ -550,6 +979,29 @@ def per_cell_line_metrics(pred, y_true, groups):
 
 
 def print_metrics(results, label):
+    """Pretty-print a per-cell-line metric table and return the two means.
+
+    Parameters
+    ----------
+    results : list of dict
+        Output of :func:`per_cell_line_metrics`.
+    label : str
+        Heading printed above the table, e.g. ``'MASK strategy'``.
+
+    Returns
+    -------
+    mean_auroc : float
+        Unweighted mean AUROC over the rows of ``results``.
+    mean_auprc : float
+        Unweighted mean AUPRC over the rows of ``results``.
+
+    Notes
+    -----
+    These are *macro* means over cell lines, not micro/pooled values: a cell line
+    with many more test CREs does not dominate. The manuscript reports
+    per-cell-line AUROC/AUPRC (§6.1) and medians via :func:`m2a_combo_score`;
+    the arithmetic mean printed here is only a run-time summary.
+    """
     print(f'\n=== {label} ===')
     print(f'{"Cell Line":<12} {"n_pos":<8} {"n_neg":<8} {"AUROC":<8} {"AUPRC":<8}')
     print('-' * 44)

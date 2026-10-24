@@ -268,7 +268,7 @@ def auprc_safe(y_true: np.ndarray, y_score: np.ndarray) -> float:
     Returns
     -------
     float
-        Average precision; ``nan`` only for an empty input.
+        Average precision in [0, 1]. An empty input is not guarded and raises.
 
     Notes
     -----
@@ -363,8 +363,10 @@ def _apply_group_exclude(
         The filtered arrays. When nothing is excluded the input objects are
         returned unchanged (no copy is made).
     groups : numpy.ndarray of str
-        Group identifiers, always converted to ``str`` so that integer codes and
-        NumPy string scalars compare consistently against the exclusion set.
+        Group identifiers. On the filtering path they are converted to ``str`` so
+        that integer codes and NumPy string scalars compare consistently against
+        the exclusion set; on the no-filter path the input array is returned
+        untouched, keeping its original dtype.
 
     Notes
     -----
@@ -561,6 +563,10 @@ macro_auroc = macro_auroc_per_group
 macro_auprc = macro_auprc_per_group
 median_auroc = median_auroc_per_group
 median_auprc = median_auprc_per_group
+# NOTE: these are plain name bindings, not second implementations --
+# `macro_auroc` *is* `macro_auroc_per_group`, and likewise for the other
+# three. The duplicate spellings exist only so that older call sites keep
+# working; document or fix the `*_per_group` definitions.
 
 
 def per_group_auroc_auprc(
@@ -1912,7 +1918,7 @@ def compute_n3_ext_pk10_success_gates(
         return float(np.mean(vals)) if vals else float("nan")
 
     def _ok_pk(x: float, tgt: float) -> bool:
-        """``nan``-safe ``x >= tgt`` test with the threshold passed explicitly."""
+        """``nan``-safe ``x >= tgt`` test; the threshold is passed in, not closed over."""
         return x == x and x >= float(tgt)
 
     ok_c10 = _ok_pk(c_pk, tgt10)
@@ -2188,7 +2194,7 @@ def compute_n4_success_gates(
         return float(np.mean(vals)) if vals else float("nan")
 
     def _ok(x: float, tgt: float) -> bool:
-        """``nan``-safe ``x >= tgt`` test with the threshold passed explicitly."""
+        """``nan``-safe ``x >= tgt`` test; the threshold is passed in, not closed over."""
         return x == x and x >= float(tgt)
 
     med_auroc = float(test_auroc_median) if test_auroc_median is not None else float("nan")

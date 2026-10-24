@@ -130,13 +130,11 @@ def init_model():
     * Both kernel tensors come from ``data/consensus_pwms.meme`` through
       ``escreen.motif.load_pwm_from_meme_c(..., max_length=35)``, i.e. the
       forward and reverse-complement PWM blocks padded to 35 bp as described in
-      Supplementary Methods section 2.3.6.  Note that
-      ``eSCREEN_backbone(filter_type='pwm')`` reads ``kwargs['kernel_fwd']``
-      twice, so the reverse-complement tensor computed here is currently ignored
-      and the 1,274 motif channels are the 637 forward PWMs duplicated rather
-      than 637 forward + 637 reverse - a known mismatch with the manuscript (see
-      the note in ``escreen/model.py``).  This function still builds and passes
-      both, so fixing the backbone needs no change here.
+      Supplementary Methods section 2.3.6.  They are handed to
+      ``eSCREEN_backbone(filter_type='pwm')`` as ``kernel_fwd`` and
+      ``kernel_rev``; the backbone concatenates the two blocks along the output
+      channel axis, so the 1,274 frozen Conv1d filters are 637 forward PWMs
+      followed by their 637 reverse complements.
     * Cell-type conditioning uses the Geneformer embeddings of
       ``data/DepMap_CellLine_embedding.pkl`` (mean-pooled DepMap bulk RNA-seq,
       Supplementary Methods section 2.3.5) plus the Geneformer V1-10M model and
@@ -165,9 +163,8 @@ def init_model():
     meme_file = str(DATA_DIR / "consensus_pwms.meme")
     motifs_f, motifs_r, _, _ = load_pwm_from_meme_c(meme_file, max_length=35)
     kernel_fwd = torch.tensor(motifs_f, dtype=torch.float)
-    # NOTE (documented, not fixed): the backbone currently reads kernel_fwd for
-    # both strands, so kernel_rev is built but never consumed; see the note in
-    # eSCREEN_backbone's 'pwm' branch.
+    # Reverse-complement PWMs.  The backbone stacks them after the forward block,
+    # so channel i < n_motifs is the forward strand and i + n_motifs the reverse.
     kernel_rev = torch.tensor(motifs_r, dtype=torch.float)
 
     # Geneformer cell-type embeddings (Supplementary Methods section 2.3.5) and

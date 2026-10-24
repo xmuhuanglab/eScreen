@@ -246,7 +246,8 @@ class eSCREEN_backbone(nn.Module):
 
         Notes
         -----
-        Values fixed for every block, matching Section 2.1:
+        Values shared by the three Hyena variants (``HyenaSE``, ``HyenaMR``,
+        ``HyenaLI``), matching Section 2.1:
 
         ``state_size = 16``
             Order of the implicit state-space recurrence.
@@ -254,12 +255,18 @@ class eSCREEN_backbone(nn.Module):
             Depth-wise short convolution applied before the long path; 3 bp is
             the shortest kernel that still couples adjacent nucleotides.
         ``bidirectional = True``
-            No causal mask, so both strands of context are visible.
+            The Hyena operators are built without a directional split, so a
+            position can integrate context from both sides.
         ``use_flashfft = False``, ``use_flash_depthwise = False``
             The FFT fast path is disabled; a 512 bp CRE is short enough that
             the plain recurrence is faster and numerically simpler.
         ``inner_mlp_size = 256``, ``mlp_activation = 'gelu'``
             Shared gated-MLP width and activation.
+
+        The ``'Attention'`` branch takes none of the Hyena arguments above.  It
+        builds a plain multi-head attention block with 8 heads and a gated MLP,
+        and its masking behaviour is fixed inside ``AttentionBlock`` rather than
+        chosen here.
         """
         if block_type=='HyenaSE':
             return ParallelGatedConvBlock(

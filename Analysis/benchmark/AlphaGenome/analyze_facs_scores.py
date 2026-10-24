@@ -12,6 +12,66 @@ Pipeline (from AlphaGenome_perturbation_FACS.ipynb):
 
 Usage:
     python analyze_facs_scores.py
+
+What this script implements
+---------------------------
+The AlphaGenome arm of the FACS readout-specific evaluation in Supplementary
+Methods §5.5 (K562 and hPSC), scored with AUROC/AUPRC as specified in §7.1. The
+prediction tensors it reads were produced by ``run_facs_perturbation.py``; this
+script never calls the model.
+
+Scoring definition
+------------------
+For each CRE both perturbation scores are accumulated over *all* output bins of
+the 1 Mb window::
+
+    mask_score    = sum(wt - mask)
+    shuffle_score = sum(wt - shuffle)
+
+i.e. the "absolute difference between the two outputs" of Supplementary Methods
+§6.2.2, summed over bins instead of averaged, so the magnitude scales with the
+number of bins (1,024 for the CAGE head). The score is signed: a positive value
+means the perturbation *reduced* predicted CAGE output.
+
+Label definition
+----------------
+Supplementary Methods §5.5 defines active CREs by ``tRRA > 2``; this script
+binarises at ``RRA > 1`` (see :func:`load_and_merge`) and
+:func:`threshold_sensitivity` sweeps 0.5-3.0 around that cut. The manuscript
+threshold and this default therefore differ — the sweep exists for that reason.
+
+Expected on disk
+----------------
+``data/AlphaGenome_FACS_perturbation.h5``
+    Written by ``run_facs_perturbation.py``; layout::
+
+        /cage/<sample_id>/wt      float16 (n_bins,)
+        /cage/<sample_id>/mask    float16 (n_bins,)
+        /cage/<sample_id>/shuffle float16 (n_bins,)
+        attrs: chr, start, end, cell_line
+
+``data/FACS_fluorescence_dataset.txt``
+    Tab-separated CRE table with at least ``id``, ``cell_line``, ``chr``,
+    ``start``, ``end``, ``RRA``. The code calls the activity column ``RRA``
+    although the manuscript describes the quantity as tRRA.
+``data/FACS_split_{hPSC,K562}_ids.json``
+    The CRE-level 7:2:1 test split, shape ``{"test": [{"cre_ids": ...}, ...]}``.
+
+Output artifacts: ``data/AlphaGenome_FACS_perturbation_scores.csv`` plus four
+PNGs under ``data/`` (threshold sensitivity, score-vs-RRA scatter, RRA-quintile
+plot, example WT/MASK/SHUFFLE tracks).
+
+Known defect
+------------
+:func:`evaluate_on_test` and :func:`threshold_sensitivity` unpack the return of
+``alphagenome_common.m2a_combo_score`` into ``(score, results)``, but that helper
+returns a single float. Running this script end-to-end therefore raises
+``TypeError: cannot unpack non-iterable float object`` as soon as step 3 starts;
+steps 1-2 and their HDF5/CSV products are unaffected.
+
+External dependencies not vendored in this repository: ``h5py``, ``matplotlib``
+and ``scipy`` (``alphagenome_common`` is local; this analysis path does not need
+the AlphaGenome client or the API keys).
 """
 import json
 import h5py
@@ -31,11 +91,40 @@ from alphagenome_common import (
 
 OUTPUT_H5 = 'data/AlphaGenome_FACS_perturbation.h5'
 SCORE_CSV = 'data/AlphaGenome_FACS_perturbation_scores.csv'
+# Declared but never read in this script: the FACS runs resume from the HDF5
+# itself (see run_facs_perturbation.py), so this path is vestigial. Adjust the
+# two paths above if rerunning on another machine.
 CHECKPOINT_FILE = 'data/checkpoint_FACS_perturb.pkl'
 
 
 def compute_scores_from_h5(cre_df=None):
-    """Compute mask_score / shuffle_score for every sample in HDF5."""
+    """Compute mask_score / shuffle_score for every sample in HDF5.
+
+    Parameters
+    ----------
+    cre_df : pandas.DataFrame or None, optional
+        Unused. Present only so that callers can pass the CRE table through
+        without branching; all metadata is read from the HDF5 attributes.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per HDF5 sample group with columns ``sample_id``
+        (``"{id}@{cell_line}"``), ``cell_line``, ``mask_score`` and
+        ``shuffle_score``.
+
+    Notes
+    -----
+    * Each data set is read into ``float32`` before subtraction. The arrays are
+      stored as ``float16``; differencing in half precision would quantise the
+      small WT-vs-perturbed differences that *are* the signal, so the upcast is
+      deliberate.
+    * Scores are summed over every bin of the 1 Mb window (the CAGE head returns
+      1,024 bins at 1 kb resolution). No window restriction is applied, so
+      effects anywhere in the window contribute, not only at the CRE.
+    * Reads the whole file group by group instead of loading it at once; the
+      FACS dataset's combined arrays would exceed RAM as a single dense tensor.
+    """
     with h5py.File(OUTPUT_H5, 'r') as f:
         cage = f['cage']
         sample_ids = list(cage.keys())
@@ -64,7 +153,36 @@ def compute_scores_from_h5(cre_df=None):
 
 
 def load_and_merge(score_df, cre_csv='data/FACS_fluorescence_dataset.txt'):
-    """Merge scores with the original FACS data, create RRA > 1 binary labels."""
+    """Merge scores with the original FACS data, create RRA > 1 binary labels.
+
+    Parameters
+    ----------
+    score_df : pandas.DataFrame
+        Output of :func:`compute_scores_from_h5`.
+    cre_csv : str, optional
+        Tab-separated FACS CRE table.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Left-joined table (scores kept even if the CRE is missing from the
+        reference table, but such rows are then dropped on the null ``RRA``). It
+        gains an ``id``/``cl`` split of ``sample_id`` and an integer ``label``.
+
+    Notes
+    -----
+    * ``sample_id`` is ``"{cre_id}@{cell_line}"``; splitting on ``'@'`` is safe
+      only because CRE ids do not contain that character.
+    * Rows with a null ``RRA`` are dropped: a CRE with no activity measurement
+      cannot be labelled, and silently treating it as negative would inflate
+      specificity.
+    * The threshold here is ``RRA > 1``, *not* the ``tRRA > 2`` used in
+      Supplementary Methods §5.5. Positives are therefore far more numerous than
+      the manuscript's 3,592 / 2,253 counts, which is why AUPRC should be read
+      alongside AUROC.
+    * The merged table is also written to :data:`SCORE_CSV` because the plots
+      and any downstream re-analysis reuse it.
+    """
     cre_df = pd.read_csv(cre_csv, sep='\t')
 
     # Parse sample_id -> id + cell_line
@@ -88,7 +206,24 @@ def load_and_merge(score_df, cre_csv='data/FACS_fluorescence_dataset.txt'):
 
 
 def load_test_ids():
-    """Load FACS test split CRE ids (same as 20260611/run_FACS_benchmark.py)."""
+    """Load FACS test split CRE ids (same as 20260611/run_FACS_benchmark.py).
+
+    Returns
+    -------
+    list of str
+        Test-split identifiers in ``"{cre_id}@{cell_line}"`` form — hPSC ids
+        first, then K562 ids, so the list order mirrors the JSON payloads rather
+        than any meaningful ordering.
+
+    Notes
+    -----
+    The split is CRE-identifier level (7:2:1) and is shared with the eScreen and
+    other baseline scripts via these JSON files, which is what makes the
+    cross-model comparison in Supplementary Methods §6.1 fair: every model is
+    scored on exactly the same held-out CREs. The comment references
+    ``20260611/run_FACS_benchmark.py``, a path outside this directory that is
+    not part of the repository snapshot.
+    """
     with open('data/FACS_split_hPSC_ids.json', 'r') as file:
         hPSC_testset = pd.DataFrame(json.load(file)['test'])
         hPSC_testset['cell_line'] = 'hPSC'
@@ -103,7 +238,30 @@ def load_test_ids():
 
 
 def evaluate_on_test(merged):
-    """Evaluate MASK / SHUFFLE strategies on the FACS test split."""
+    """Evaluate MASK / SHUFFLE strategies on the FACS test split.
+
+    Parameters
+    ----------
+    merged : pandas.DataFrame
+        Output of :func:`load_and_merge`.
+
+    Returns
+    -------
+    dict
+        ``combo_mask``, ``combo_shuffle`` and the two per-cell-line metric lists
+        under ``results_mask`` / ``results_shuffle``.
+
+    Notes
+    -----
+    * ``groups`` is the cell-line column, so AUROC/AUPRC are computed per cell
+      line and then reduced with the m2a composite of Supplementary Methods
+      §5.5 — a model is never scored by pooling K562 and hPSC, which would mix
+      two very different label prevalences.
+    * **Currently broken**: it unpacks the float returned by
+      ``m2a_combo_score`` into two values and will raise ``TypeError``. See the
+      module docstring; the fix would be to call ``m2a_combo_score`` and
+      ``per_cell_line_metrics`` separately.
+    """
     idset = load_test_ids()
     test = merged[merged['sample_id'].isin(idset)]
     groups = test['cell_line'].values
@@ -125,7 +283,32 @@ def evaluate_on_test(merged):
 
 
 def threshold_sensitivity(merged):
-    """AUROC / AUPRC changes across different RRA thresholds."""
+    """AUROC / AUPRC changes across different RRA thresholds.
+
+    Parameters
+    ----------
+    merged : pandas.DataFrame
+        Output of :func:`load_and_merge`, restricted internally to the test
+        split.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per threshold with ``threshold``, ``n_pos``, ``n_neg``,
+        ``mask_combo``, ``shuffle_combo``, ``mask_AUROC`` and ``shuffle_AUROC``;
+        also written as ``data/FACS_threshold_sensitivity.png``.
+
+    Notes
+    -----
+    * The threshold sweep exists because the script's default binarisation
+      (``RRA > 1``) does not match Supplementary Methods §5.5 (``tRRA > 2``).
+      Showing the curve is the honest way to report that choice.
+    * A threshold is skipped when it leaves fewer than 10 samples of either
+      class: AUROC becomes extremely noisy and AUPRC is dominated by the class
+      prior, so the point would be misleading rather than informative.
+    * Same ``m2a_combo_score`` unpacking defect as :func:`evaluate_on_test`;
+      this function raises before the figure is written.
+    """
     idset = load_test_ids()
     test = merged[merged['sample_id'].isin(idset)].copy()
     groups = test['cell_line'].values
@@ -164,7 +347,32 @@ def threshold_sensitivity(merged):
 
 
 def correlation_with_rra(merged):
-    """Spearman correlation between perturbation score and RRA + scatter plots."""
+    """Spearman correlation between perturbation score and RRA + scatter plots.
+
+    Parameters
+    ----------
+    merged : pandas.DataFrame
+        Output of :func:`load_and_merge`; **all** FACS samples are used here, not
+        only the test split.
+
+    Returns
+    -------
+    None
+        Results are printed and written to
+        ``data/FACS_perturbation_vs_RRA.png``.
+
+    Notes
+    -----
+    * Spearman rather than Pearson: the relationship between an in silico
+      perturbation magnitude and tRRA is monotone at best, and both variables
+      have heavy tails and outliers that Pearson would be dominated by.
+    * Including the non-test samples makes this a descriptive sanity check, not
+      a benchmark number — the AUROC/AUPRC in :func:`evaluate_on_test` are the
+      reported values.
+    * The p-values are computed per cell line without multiple-testing
+      correction; with tens of thousands of CREs essentially anything is
+      "significant", so read the rho, not the p.
+    """
     print('\n=== Spearman Correlation: Perturbation Score vs RRA ===')
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
     for ax, cell, color in [(axes[0], 'K562', '#E74C3C'), (axes[1], 'hPSC', '#3498DB')]:
@@ -188,7 +396,29 @@ def correlation_with_rra(merged):
 
 
 def quintile_plot(merged):
-    """Mean MASK perturbation score by RRA quintile."""
+    """Mean MASK perturbation score by RRA quintile.
+
+    Parameters
+    ----------
+    merged : pandas.DataFrame
+        Output of :func:`load_and_merge`.
+
+    Returns
+    -------
+    None
+        The figure is written to
+        ``data/FACS_perturbation_by_RRA_quintile.png``.
+
+    Notes
+    -----
+    * ``rank(method='first')`` before ``qcut`` guarantees five equally sized bins
+      even though RRA has many ties (many CREs share the same discretised
+      value); without the rank, ``qcut`` would raise on duplicate bin edges.
+    * Error bars are the standard error of the mean (``sem``), not the standard
+      deviation, so they shrink with the (large) per-quintile sample count.
+    * Only the MASK score is plotted; the SHUFFLE panel is intentionally left to
+      the scatter plot.
+    """
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     for ax, cell, color in [(axes[0], 'K562', '#E74C3C'), (axes[1], 'hPSC', '#3498DB')]:
         sub = merged[merged['cell_line'] == cell].copy()
@@ -209,7 +439,38 @@ def quintile_plot(merged):
 
 
 def plot_tracks(merged, sample_id, window_bp=20000, save_prefix='data/FACS_track'):
-    """Example: WT / MASK / SHUFFLE CAGE tracks for a sample."""
+    """Example: WT / MASK / SHUFFLE CAGE tracks for a sample.
+
+    Parameters
+    ----------
+    merged : pandas.DataFrame
+        Output of :func:`load_and_merge`, used to look up the CRE interval and
+        its score for the title.
+    sample_id : str
+        HDF5 group name, ``"{cre_id}@{cell_line}"``.
+    window_bp : int, optional
+        Width of the plotted genomic window in bp, centred on the perturbed
+        region (default 20 kb).
+    save_prefix : str, optional
+        Filename prefix; ``"@"`` in the sample id is replaced by ``"_"``.
+
+    Returns
+    -------
+    None
+        The figure is written to ``"{save_prefix}_{sample_id}.png"``.
+
+    Notes
+    -----
+    * Two different coordinate systems meet here. The stored arrays are indexed
+      by *window offset* (0 .. 1,048,575) while the x axis is genomic: the
+      conversion is ``x = begin + offset``, where ``begin`` is the HDF5
+      ``start`` attribute — i.e. the genomic start of the 1 Mb window, which is
+      negative when the window runs off the chromosome start.
+    * The shaded CRE span is drawn from ``merged``'s genomic ``start``/``end``,
+      so it lines up with the x axis directly and *not* with the array index.
+    * The perturbed window is always centred at :data:`PERTURB_CENTER`
+      (524,288) in window-local coordinates, hence ``s = center - half``.
+    """
     with h5py.File(OUTPUT_H5, 'r') as f:
         grp = f['cage'][sample_id]
         wt_data      = grp['wt'][:]
@@ -243,6 +504,19 @@ def plot_tracks(merged, sample_id, window_bp=20000, save_prefix='data/FACS_track
 
 
 def main():
+    """Run the whole FACS analysis chain and print the artifact list.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Order matters: scores must exist before the merge, and the merge before any
+    evaluation or plot. As noted in the module docstring, the run aborts inside
+    :func:`evaluate_on_test` (float-unpacking bug), so the plots below it are not
+    reached until that is fixed.
+    """
     score_df = compute_scores_from_h5()
     merged = load_and_merge(score_df)
     evaluate_on_test(merged)
