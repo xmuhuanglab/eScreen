@@ -4,7 +4,7 @@ Usage:
     python -m escreen.serve --hostname 0.0.0.0 --port 8501
 
 Interface surface (this module has no HTTP routes)
------------------------------------------------
+--------------------------------------------------
 ``serve.py`` is a **Streamlit** application, not a REST service: it defines no
 ``@app.route``, no FastAPI/Flask handler and no JSON-over-HTTP endpoint.  What it
 exposes is a browser UI with three tabs, served by Streamlit's own websocket

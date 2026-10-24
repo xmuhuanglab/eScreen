@@ -163,9 +163,9 @@ class ParallelGatedConvBlock(nn.Module):
         ).to(dtype=mlp_dtype)
 
         if compile:
-        # torch.compile is opt-in and is not enabled by eScreen: the model is
-        # trained/inferred in bfloat16 where these two tiny helper functions are
-        # already dominated by the kernels they call.
+            # torch.compile is opt-in and is not enabled by eScreen: the model is
+            # trained/inferred in bfloat16 where these two tiny helper functions are
+            # already dominated by the kernels they call.
             self.proj_norm_fn = torch.compile(self.proj_norm, fullgraph=True, dynamic=False, mode="reduce-overhead")
             self.res_mlp_norm_fn = torch.compile(
                 self.res_mlp_norm, fullgraph=True, dynamic=False, mode="reduce-overhead"
@@ -238,10 +238,10 @@ class ParallelGatedConvBlock(nn.Module):
         normalized = self.pre_norm(x)
         normalized = self.pad_to_multiple(normalized)
         with torch.cuda.device(x.device):
-        # Scopes the projection to the tensor's CUDA device.  Redundant in eScreen,
-        # where the whole backbone lives on one device; it exists because the
-        # optional FP8/multi-device projection kernels dispatch on the *current*
-        # CUDA device rather than on the input's.
+            # Scopes the projection to the tensor's CUDA device.  Redundant in eScreen,
+            # where the whole backbone lives on one device; it exists because the
+            # optional FP8/multi-device projection kernels dispatch on the *current*
+            # CUDA device rather than on the input's.
             projected = self.projections(normalized)
 
         if isinstance(projected, tuple):

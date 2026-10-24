@@ -1,10 +1,72 @@
+"""Cell-type embeddings for eScreen.
+
+eScreen conditions its prediction on *which cell line* a CRE is being scored
+in.  That conditioning vector is produced here, and the module contains **two
+independent implementations** of it, only one of which is used in the paper:
+
+1. :class:`CellEncoder` / :class:`ExprDecoder` / :class:`CellEmb` -- a small
+   transformer trained from scratch with a masked-expression-modelling
+   objective on bulk/single-cell expression vectors.  Self-contained and
+   dependency-light, but *not* the path used for the reported results.
+
+2. :class:`Geneformer` -- a thin wrapper around the pretrained Geneformer V1
+   model.  **This is the production path** described in Supplementary Methods
+   Section 2.3.5: DepMap bulk RNA-seq profiles are tokenised the way Geneformer
+   prescribes, the hidden states of the penultimate layer are mean-pooled over
+   the valid gene tokens, and the resulting vector is used as the cell-type
+   embedding (normalisation target sum 10,000).
+
+The reason for preferring Geneformer is stated in Section 2.3.5: it was
+pretrained on roughly 30 million single-cell transcriptomes and therefore
+already encodes the hierarchical structure of gene regulatory programmes, which
+a small supervised encoder trained on a few hundred cell lines cannot recover.
+
+Downstream, the embedding is projected to the model width and fed to
+``CellConditionedLoRA`` as well as to the prototype router of the MoE readout
+(see ``escreen.py``).
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import random
 
 class CellEncoder(nn.Module):
+    """Expression-to-embedding transformer encoder (alternative to Geneformer).
+
+    Not used in the published pipeline.  Kept because it provides the same
+    interface as the Geneformer wrapper -- ``(gene_ids, exprs) -> [B, d_model]``
+    -- which makes it a drop-in substitute for quick experiments when the
+    Geneformer checkpoints are not available.
+
+    Parameters
+    ----------
+    num_genes : int
+        Size of the gene vocabulary.  The default used by :class:`CellEmb`
+        (19,215) is the number of protein-coding genes in the Geneformer
+        dictionary.
+    d_model : int, default 256
+        Embedding width.
+    nhead : int, default 4
+        Number of attention heads.
+    num_layers : int, default 4
+        Number of transformer-encoder layers.
+    """
+
     def __init__(self, num_genes, d_model=256, nhead=4, num_layers=4):
+        """Build the gene embedding, the expression MLP and the encoder stack.
+
+        Parameters
+        ----------
+        num_genes : int
+            Gene vocabulary size.
+        d_model : int, default 256
+            Embedding width.
+        nhead : int, default 4
+            Attention heads.
+        num_layers : int, default 4
+            Encoder depth.
+        """
         super().__init__()
 
         # gene identity
@@ -29,9 +91,39 @@ class CellEncoder(nn.Module):
         self.attn_pool = nn.Linear(d_model, 1)
 
     def forward(self, gene_ids, exprs, log1p = True):
-        """
-        gene_ids: (B, N)
-        exprs:    (B, N)
+        """Encode a batch of expression vectors into cell embeddings.
+
+        Parameters
+        ----------
+        gene_ids : torch.Tensor
+            Gene indices, ``[B, N]``, ``int64``.  ``N`` is the number of genes
+            retained per cell after normalisation and truncation.
+        exprs : torch.Tensor
+            Matching expression values, ``[B, N]``, float.
+        log1p : bool, default True
+            Whether ``exprs`` has already been log1p-transformed.  If False the
+            transform is applied here.
+
+        Returns
+        -------
+        cell_emb : torch.Tensor
+            Attention-pooled cell embedding, ``[B, d_model]``.
+        x : torch.Tensor
+            Per-gene token embeddings, ``[B, N, d_model]``.  Returned because
+            the expression decoder needs them for the masked-modelling loss.
+
+        Notes
+        -----
+        There is deliberately **no positional encoding**.  The gene axis is a
+        set, not a sequence: genes are sorted by expression level, so their
+        position carries no biological meaning and a positional code would
+        inject a spurious signal (a gene's "position" would change whenever the
+        ranking changed).
+
+        Expression enters multiplicatively as a gate, ``g_emb * sigmoid(e_emb)``,
+        rather than additively.  The sigmoid bounds the gate to ``(0, 1)``, so a
+        gene can be strongly attenuated when it is not expressed but can never
+        be sign-flipped, which keeps the gene-identity direction intact.
         """
 
         # gene embedding
@@ -55,13 +147,62 @@ class CellEncoder(nn.Module):
         return cell_emb, x  # x is used for the mask task
     
 def mask_expression(exprs, mask_ratio=0.15):
+    """Randomly zero a fraction of expression values for masked training.
+
+    Simulates dropout of individual gene measurements so that the decoder has
+    to reconstruct them from the remaining context -- the masked-modelling
+    pretext used by the self-supervised variant in this module.
+
+    Parameters
+    ----------
+    exprs : torch.Tensor
+        Expression matrix, ``[B, N]``.
+    mask_ratio : float, default 0.15
+        Fraction of entries to hide.
+
+    Returns
+    -------
+    masked_exprs : torch.Tensor
+        Copy of ``exprs`` with the selected entries set to zero.  The input
+        tensor is not modified.
+    mask : torch.Tensor
+        Boolean tensor, ``[B, N]``, True where a value was hidden.  Used to
+        restrict the reconstruction loss to the masked positions.
+
+    Notes
+    -----
+    Masking by setting values to exactly zero keeps the gene present in the
+    input as an all-zero token; the model therefore still knows *which* gene was
+    unobserved, it only lacks the magnitude.  This is intentional -- it mirrors
+    Geneformer's masked-learning setup, where the gene token remains in the
+    sequence.
+    """
     mask = torch.rand(exprs.shape, device=exprs.device) < mask_ratio
     masked_exprs = exprs.clone()
     masked_exprs[mask] = 0.0
     return masked_exprs, mask
 
 class ExprDecoder(nn.Module):
+    """Reconstruct per-gene expression from transformer token embeddings.
+
+    The decoding half of the masked-modelling pretext: each gene token is
+    mapped back to a scalar expression value, and the error on the masked
+    positions provides the training signal for :class:`CellEncoder`.
+
+    Parameters
+    ----------
+    d_model : int
+        Width of the token embeddings produced by :class:`CellEncoder`.
+    """
+
     def __init__(self, d_model):
+        """Build the two-layer scalar regression head.
+
+        Parameters
+        ----------
+        d_model : int
+            Token-embedding width.
+        """
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(d_model, d_model),
@@ -70,9 +211,44 @@ class ExprDecoder(nn.Module):
         )
 
     def forward(self, x):
+        """Decode token embeddings into expression values.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Token embeddings, ``[B, N, d_model]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Predicted expression, ``[B, N]``.  The trailing singleton axis is
+            squeezed away, so callers get a matrix aligned with ``exprs``.
+        """
         return self.mlp(x).squeeze(-1)  # (B, N)
     
 def augment(exprs):
+    """Apply gene dropout plus additive Gaussian noise to expression values.
+
+    A light data augmentation for the self-supervised encoder: zeroing 10% of
+    the genes mimics panel dropout, while the noise term prevents the model from
+    keying on exact quantised values of the bulk RNA-seq input.
+
+    Parameters
+    ----------
+    exprs : torch.Tensor
+        Expression matrix, ``[B, N]``.
+
+    Returns
+    -------
+    torch.Tensor
+        Augmented copy of the input.  The original tensor is not modified.
+
+    Notes
+    -----
+    The noise is scaled by 0.1 in the *transformed* space.  Since the input is
+    expected to be log1p-transformed, a unit of noise here corresponds to a
+    multiplicative change of about ``exp(0.1)`` in raw counts, i.e. roughly 10%.
+    """
     # dropout genes
     drop_mask = torch.rand(exprs.shape, device=exprs.device) < 0.1
     exprs = exprs.clone()
@@ -84,21 +260,61 @@ def augment(exprs):
 
 
 class CellEmb(nn.Module):
+    """Masked-expression autoencoder producing cell embeddings.
+
+    Bundles :class:`CellEncoder` and :class:`ExprDecoder` so that a single call
+    returns both the cell embedding (needed downstream by eScreen) and the
+    reconstruction (needed for the training objective).
+
+    Not used in the published pipeline -- see the module docstring.  It exists
+    as a self-contained alternative to the Geneformer wrapper below.
+
+    Parameters
+    ----------
+    num_genes : int, default 19215
+        Gene vocabulary size, matching the Geneformer gene dictionary.
+    d_model : int, default 256
+        Embedding width.
+    """
+
     def __init__(self, num_genes=19215, d_model=256):
+        """Wire the encoder and the expression decoder.
+
+        Parameters
+        ----------
+        num_genes : int, default 19215
+            Gene vocabulary size.
+        d_model : int, default 256
+            Embedding width.
+        """
         super().__init__()
         self.encoder = CellEncoder(num_genes=num_genes)
         self.decoder = ExprDecoder(d_model=d_model)
     
     def forward(self, gene_ids, exprs, mask_ratio=0.15):
-        """
-        Full model forward pass
-        Args:
-            gene_ids: (B, N) gene indices
-            exprs: (B, N) expression values
-            mask_ratio: ratio of genes to mask for training
-        Returns:
-            pred_expr: (B, N) predicted expressions
-            cell_emb: (B, d_model) cell embedding
+        """Run the masked-modelling forward pass.
+
+        Parameters
+        ----------
+        gene_ids : torch.Tensor
+            Gene indices, ``[B, N]``.
+        exprs : torch.Tensor
+            Expression values, ``[B, N]``.
+        mask_ratio : float, default 0.15
+            Fraction of entries hidden before encoding.
+
+        Returns
+        -------
+        pred_expr : torch.Tensor
+            Reconstructed expression, ``[B, N]``.
+        cell_emb : torch.Tensor
+            Cell embedding, ``[B, d_model]``.
+        mask : torch.Tensor
+            Boolean mask, ``[B, N]``, marking the hidden entries.  The training
+            loss should be evaluated **only** on ``mask`` -- the unmasked
+            positions are trivially reconstructible as they are copied straight
+            through the encoder input, so including them would dominate the
+            gradient with a near-identity task.
         """
         # Masked modeling forward
         masked_exprs, mask = mask_expression(exprs, mask_ratio)
@@ -108,12 +324,43 @@ class CellEmb(nn.Module):
         return pred_expr, cell_emb, mask
     
     def encode_cell(self, gene_ids, exprs):
-        """Encode only, no decoding; used to obtain cell representations"""
+        """Encode only, no decoding; used to obtain cell representations.
+
+        Skips the masking step, so the encoder sees the full expression vector.
+        This is the method to call when the embedding is needed for inference
+        rather than for training.
+
+        Parameters
+        ----------
+        gene_ids : torch.Tensor
+            Gene indices, ``[B, N]``.
+        exprs : torch.Tensor
+            Expression values, ``[B, N]``, unmasked.
+
+        Returns
+        -------
+        torch.Tensor
+            Cell embedding, ``[B, d_model]``.
+        """
         cell_emb, _ = self.encoder(gene_ids, exprs)
         return cell_emb
     
     def decode(self, token_emb):
-        """Decode only"""
+        """Decode only, given already-computed token embeddings.
+
+        Decoupled from :meth:`encode_cell` so that the decoder can be trained or
+        probed separately without re-running the encoder.
+
+        Parameters
+        ----------
+        token_emb : torch.Tensor
+            Per-gene token embeddings, ``[B, N, d_model]``.
+
+        Returns
+        -------
+        torch.Tensor
+            Reconstructed expression, ``[B, N]``.
+        """
         return self.decoder(token_emb)
     
 

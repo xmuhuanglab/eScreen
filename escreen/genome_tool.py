@@ -736,6 +736,39 @@ def eqtlboxplot_draw(data,chromo,lo=None,label='eQTL boxplot figure',label_list=
     import concurrent.futures
 
     def process_group(ii,guide_expand=guide_expand,expand=expand):
+        """Count eQTL variants for one group of intervals (thread-worker body).
+
+        Runs inside a ``ThreadPoolExecutor`` with one call per group, so `ii` is
+        a whole DataFrame rather than a row.
+
+        Parameters
+        ----------
+        ii : pandas.DataFrame
+            One group's intervals, with ``chr``, ``start``, ``end``.  Mutated in
+            place with the ``snp`` count column.
+        guide_expand : bool
+            Bound from the enclosing function; widens each interval by
+            ``expand`` bp on both sides when True.
+        expand : int
+            Bound from the enclosing function; expansion in bp.
+
+        Returns
+        -------
+        pandas.DataFrame
+            ``ii`` with ``snp`` added: per-interval eQTL variant counts, ``NaN``
+            for chrX, 0 for degenerate (zero-length) or unparsable intervals.
+
+        Notes
+        -----
+        * ``itertuples(index=False, name=None)`` yields plain
+          ``(chrom, start, end)`` tuples, which keeps the loop cheap but loses
+          the row index; the counts are therefore assigned positionally, in the
+          same order as ``ii``.
+        * ``results = {}`` and ``i = 0`` are dead locals left over from an earlier
+          revision; only ``groupresults`` is used.
+        * Progress is printed from every thread with ``\r``, so the line counter
+          interleaves when several groups run concurrently.
+        """
         groupresults = []
         intervals = list(ii[['chr','start','end']].itertuples(index=False, name=None))
         results = {}
@@ -899,6 +932,38 @@ def gwashistplot_draw(data,chromo,gwas_data,lo=None,label='GWAS figure',label_li
     import concurrent.futures
     
     def process_group(ii,guide_expand=guide_expand,expand=expand):
+        """Count GWAS variants for one group of intervals (thread-worker body).
+
+        Runs inside a ``ThreadPoolExecutor`` with one call per group.
+
+        Parameters
+        ----------
+        ii : pandas.DataFrame
+            One group's intervals, with ``chr``, ``start``, ``end``.  Mutated in
+            place with the ``gwas`` count column.
+        guide_expand : bool
+            Bound from the enclosing function; widens each interval by
+            ``expand`` bp on both sides when True.
+        expand : int
+            Bound from the enclosing function; expansion in bp.
+
+        Returns
+        -------
+        pandas.DataFrame
+            ``ii`` with ``gwas`` added: per-interval variant counts, ``NaN`` for
+            chrX, 0 for zero-length or unparsable intervals.
+
+        Notes
+        -----
+        * The Liftover retry loop has no attempt cap: only a ``None`` return from
+          ``convert_coordinate`` ends it (via ``status = 2``), so a locus that
+          keeps yielding an empty list spins forever.
+        * ``gwas_data.query(...)`` is evaluated per interval with local variables
+          interpolated through ``@``, i.e. one full-table filter per interval -
+          O(intervals x variants).  Pre-filtering by chromosome would be much
+          cheaper, but the behaviour is left as-is.
+        * ``results = {}`` and ``i = 0`` are dead locals from an earlier revision.
+        """
         groupresults = []
         intervals = list(ii[['chr','start','end']].itertuples(index=False, name=None))
         results = {}

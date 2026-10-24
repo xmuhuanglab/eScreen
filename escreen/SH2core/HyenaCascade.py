@@ -265,9 +265,9 @@ class HyenaCascade(nn.Module):
         self.fftconv_fn = None
         self.long_fir_threshold = long_fir_threshold
         if self.long_fir_threshold is not None:
-        # Time-domain convolution for very long explicit filters (memory saver for
-        # 100k+ contexts).  Nothing in eScreen sets it, and the assertion below
-        # keeps it mutually exclusive with the fused flashfft kernel.
+            # Time-domain convolution for very long explicit filters (memory saver for
+            # 100k+ contexts).  Nothing in eScreen sets it, and the assertion below
+            # keeps it mutually exclusive with the fused flashfft kernel.
             assert self.use_flashfft is False, "long_fir_threshold not compatible with fused flashfft"
 
         self.num_systems = self.hyena_filter_groups
@@ -397,8 +397,8 @@ class HyenaCascade(nn.Module):
             z_pre = interleave(z_pre)
 
         if self.h is None:
-        # HyenaLI: no explicit kernel was stored, so the long filter is the impulse
-        # response of the 16-system modal bank, materialised here in float32.
+            # HyenaLI: no explicit kernel was stored, so the long filter is the impulse
+            # response of the 16-system modal bank, materialised here in float32.
             h, _, _, _ = self.compute_filter(L, u.device)
         else:
             h = self.h
@@ -411,8 +411,8 @@ class HyenaCascade(nn.Module):
         # (1 channel per group when groups == D, i.e. eScreen's setting).
 
         if self.fir_inner_filter_length is not None:
-        # Two mutually exclusive long-filter parameterisations; exactly one of
-        # `fir_inner_filter_length` / `log_poles` exists (see __init__).
+            # Two mutually exclusive long-filter parameterisations; exactly one of
+            # `fir_inner_filter_length` / `log_poles` exists (see __init__).
 
             y, fir_inner_state = self.engine.parallel_fir(
                 self.fir_inner_fn,
