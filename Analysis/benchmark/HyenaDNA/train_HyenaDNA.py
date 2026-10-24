@@ -162,7 +162,7 @@ class HyenaDNA5Head(nn.Module):
 # ── Build HyenaDNA ──────────────────────────────────────────────────
 def build_hyenadna(model_name='tiny-1k-d256', device='cpu'):
     """Load pretrained HyenaDNA model."""
-    model_path = f'/cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/HyenaDNA/pretrained_model/{model_name}/'
+    model_path = f'/path/to/eScreen/code/HyenaDNA/pretrained_model/{model_name}/'
 
     print(f'  Loading HyenaDNA config from {model_path}config.json')
     with open(model_path + 'config.json', 'r') as f:

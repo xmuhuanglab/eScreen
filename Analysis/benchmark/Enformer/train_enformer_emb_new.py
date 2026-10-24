@@ -26,9 +26,9 @@ Expected on disk
 ----------------
 Inputs::
 
-    # Hard-coded absolute path on the authors' cluster;
+    # Placeholder absolute path;
     # only the (cell_line, label) columns and the row index are needed.
-    /cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/
+    /path/to/eScreen_training/datasets/
         TestData_20260509.randomCRE.4.pkl
 
     ./enformer_embeddings/embeddings.memmap        # (n_unique, 4, 3072) f32
@@ -65,7 +65,7 @@ from data_utils import (
 )
 
 # ── Paths ──
-ORIGINAL_PATH = "/cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/TestData_20260509.randomCRE.4.pkl"
+ORIGINAL_PATH = "/path/to/eScreen_training/datasets/TestData_20260509.randomCRE.4.pkl"
 EMBEDDINGS_DIR = './enformer_embeddings'
 MEMMAP_PATH = f'{EMBEDDINGS_DIR}/embeddings.memmap'
 CRE_TO_EMB_PATH = f'{EMBEDDINGS_DIR}/cre_to_emb_idx.pkl'

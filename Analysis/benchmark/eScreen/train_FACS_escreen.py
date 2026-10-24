@@ -23,8 +23,7 @@ by the benchmark scripts in the sibling directories.
 
 Expected on disk
 ----------------
-Inputs. Absolute paths below are hard-coded for the authors' Linux
-cluster:
+Inputs. The absolute paths below are placeholders:
 
 * ``BACKBONE_CKPT`` -- pretrained PWM backbone checkpoint
   (``backbone_20260427_pwm_29.pth``), loaded with ``strict=False``.
@@ -74,7 +73,7 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 # LD_LIBRARY_PATH at this point only affects *child* processes -- the
 # dynamic loader of the already-running interpreter has cached its search
 # paths -- so the RTLD_GLOBAL preload is what actually matters here.
-conda_lib = '/cluster2/huanglab/liquan/miniconda3/envs/shin/lib'
+conda_lib = '/path/to/conda/envs/<env>/lib'
 torch_lib = conda_lib + '/python3.10/site-packages/torch/lib'
 _ld_paths = [p for p in (conda_lib, torch_lib) if p not in os.environ.get('LD_LIBRARY_PATH', '')]
 if _ld_paths:
@@ -101,8 +100,8 @@ from torch.optim import AdamW
 # the cluster copy, not ``D:\GitHub\eScreen\escreen``. When both are
 # importable the repository package is the authoritative one.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '_shared'))
-sys.path.insert(0, '/cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/')
-sys.path.insert(0, '/cluster2/huanglab/liquan/data/eSCREEN/202604_rebuttal/CC/20260523')
+sys.path.insert(0, '/path/to/eScreen/code/')
+sys.path.insert(0, '/path/to/eScreen/202604_rebuttal/CC/20260523')
 
 from escreen import eSCREEN_backbone
 from motif import load_pwm_from_meme_c
@@ -112,8 +111,8 @@ from load_facs_data import load_facs_for_cell_line
 # Hard-coded absolute paths (cluster-specific).
 # ``BACKBONE_CKPT`` holds the distilled/pretrained PWM backbone -- the
 # eScreen encoder of §2.1; ``MEME_PATH`` supplies the fixed PWM input layer.
-BACKBONE_CKPT = '/cluster2/huanglab/liquan/data/eSCREEN/202604_rebuttal/model_weights/backbone_20260427_pwm_29.pth'
-MEME_PATH = "/cluster2/huanglab/liquan/motif/consensus_pwms.meme"
+BACKBONE_CKPT = '/path/to/eScreen/202604_rebuttal/model_weights/backbone_20260427_pwm_29.pth'
+MEME_PATH = "/path/to/motif/consensus_pwms.meme"
 
 
 # ═══════════════════════════════════════════

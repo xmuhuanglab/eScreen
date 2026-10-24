@@ -40,7 +40,7 @@ self-contained:
 
 * :func:`draw_loci_context`, :func:`draw_loci_context_ax` and
   :func:`eqtlboxplot_draw` contain hard-coded absolute paths such as
-  ``/cluster2/huanglab/liquan/data/K562/DNase.bigWig``;
+  ``/path/to/data/K562/DNase.bigWig``;
 * :func:`merge_intervals` references ``BedTool``,
   :func:`genome_sequence_withoutcoding` references ``rainbow_tqdm``, and
   :func:`eqtlboxplot_draw`` references ``time`` - none of these three names is
@@ -707,7 +707,7 @@ def eqtlboxplot_draw(data,chromo,lo=None,label='eQTL boxplot figure',label_list=
     Notes
     -----
     * The eQTL table is read from the hard-coded path
-      ``/cluster2/huanglab/liquan/data/eQTL/ciseqtl-loci.txt`` with columns
+      ``/path/to/data/eQTL/ciseqtl-loci.txt`` with columns
       ``SNPChr`` (bare integer chromosome) and ``SNPPos``, so the function is not
       portable as shipped.
     * ``chrX`` rows get ``NaN`` because ``SNPChr`` is compared after
@@ -731,7 +731,7 @@ def eqtlboxplot_draw(data,chromo,lo=None,label='eQTL boxplot figure',label_list=
     # Hard-coded eQTL table (not portable).  SNPChr is a bare integer (1..22) and
     # SNPPos is 1-based, which is why the counting test below is inclusive on both
     # ends.
-    eqtlx=pd.read_csv("/cluster2/huanglab/liquan/data/eQTL/ciseqtl-loci.txt",sep='\t')
+    eqtlx=pd.read_csv("/path/to/data/eQTL/ciseqtl-loci.txt",sep='\t')
     
     import concurrent.futures
 
@@ -1070,7 +1070,7 @@ def draw_loci_context(loci):
 
     Notes
     -----
-    * Tracks are hard-coded to ``/cluster2/huanglab/liquan/data/K562/*.bigWig``:
+    * Tracks are hard-coded to ``/path/to/data/K562/*.bigWig``:
       DNase, ATAC, H3K27ac, H3K4me3, CTCF, H3K27me3 - the marks used for the
       peak nodes of the eScreen-local graph
       (Supplementary Methods section 2.4.2).
@@ -1085,27 +1085,27 @@ def draw_loci_context(loci):
 
     # Hard-coded K562 tracks from the lab cluster: the six marks behind the peak
     # nodes and the genome-context panels.
-    bw=pyBigWig.open('/cluster2/huanglab/liquan/data/K562/DNase.bigWig')
+    bw=pyBigWig.open('/path/to/data/K562/DNase.bigWig')
     dnase_array=np.array(bw.values(chrchr,startstart,endend))
     bw.close()
 
-    bw=pyBigWig.open('/cluster2/huanglab/liquan/data/K562/ATAC.bigWig')
+    bw=pyBigWig.open('/path/to/data/K562/ATAC.bigWig')
     atac_array=np.array(bw.values(chrchr,startstart,endend))
     bw.close()
 
-    bw=pyBigWig.open('/cluster2/huanglab/liquan/data/K562/H3K27ac.bigWig')
+    bw=pyBigWig.open('/path/to/data/K562/H3K27ac.bigWig')
     k27ac_array=np.array(bw.values(chrchr,startstart,endend))
     bw.close()
 
-    bw=pyBigWig.open('/cluster2/huanglab/liquan/data/K562/H3K4me3.bigWig')
+    bw=pyBigWig.open('/path/to/data/K562/H3K4me3.bigWig')
     k4me3_array=np.array(bw.values(chrchr,startstart,endend))
     bw.close()
     
-    bw=pyBigWig.open('/cluster2/huanglab/liquan/data/K562/CTCF.bigWig')
+    bw=pyBigWig.open('/path/to/data/K562/CTCF.bigWig')
     ctcf_array=np.array(bw.values(chrchr,startstart,endend))
     bw.close()
 
-    bw=pyBigWig.open('/cluster2/huanglab/liquan/data/K562/H3K27me3.bigWig')
+    bw=pyBigWig.open('/path/to/data/K562/H3K27me3.bigWig')
     k27me3_array=np.array(bw.values(chrchr,startstart,endend))
     bw.close()
     
@@ -1156,7 +1156,7 @@ def draw_loci_context_ax(loci,feature=[],figsize=(5,3)):
 
     Notes
     -----
-    * BigWig paths are hard-coded to ``/cluster2/huanglab/liquan/data/K562/``.
+    * BigWig paths are hard-coded to ``/path/to/data/K562/``.
     * Each ribbon spans ``[y_bottom, y_bottom + signal / max(signal)]`` and
       ``y_bottom`` advances by 0.5 per feature; the y axis is therefore a stack
       index and the y ticks are hidden.
@@ -1181,7 +1181,7 @@ def draw_loci_context_ax(loci,feature=[],figsize=(5,3)):
 
     for e in feature:
         
-        bw = pyBigWig.open(f'/cluster2/huanglab/liquan/data/K562/{ epi_key_dict[e] }.bigWig')
+        bw = pyBigWig.open(f'/path/to/data/K562/{ epi_key_dict[e] }.bigWig')
         array = np.array(bw.values(chrchr, startstart, endend))
         bw.close()
         

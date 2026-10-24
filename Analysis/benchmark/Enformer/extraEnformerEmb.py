@@ -60,12 +60,12 @@ can diverge silently.
 
 Expected on disk
 ----------------
-Inputs (all hard-coded absolute paths on the authors' cluster)::
+Inputs (all placeholder absolute paths)::
 
-    /cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/
+    /path/to/eScreen_training/datasets/
         TestData_20260509.randomCRE.4.pkl      # 8-tuple eScreen bundle
-    /cluster2/huanglab/liquan/genome_ref/hg38.fa            # pyfaidx FASTA
-    /cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/Enformer/enformer_model
+    /path/to/genome_ref/hg38.fa            # pyfaidx FASTA
+    /path/to/eScreen/code/Enformer/enformer_model
         # TensorFlow SavedModel of Enformer (tf.keras.models.load_model)
 
 Outputs, in ``{script_dir}/enformer_embeddings/``::
@@ -109,9 +109,9 @@ import pandas as pd
 warnings.filterwarnings('ignore')
 
 # ── Paths & Constants ─────────────────────────────────────
-ORIGINAL_PATH = "/cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/TestData_20260509.randomCRE.4.pkl"
-FASTA_PATH = "/cluster2/huanglab/liquan/genome_ref/hg38.fa"
-ENFORMER_MODEL_PATH = "/cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/Enformer/enformer_model"
+ORIGINAL_PATH = "/path/to/eScreen_training/datasets/TestData_20260509.randomCRE.4.pkl"
+FASTA_PATH = "/path/to/genome_ref/hg38.fa"
+ENFORMER_MODEL_PATH = "/path/to/eScreen/code/Enformer/enformer_model"
 
 P0_CELL_LINES = ['A375', 'HT29', 'HepG2', 'K562', 'hPSC']
 P0_RELABEL = {'WTC11': 'hPSC'}

@@ -55,7 +55,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from ResNeXt_conv1_128_btnk_2dense import ResNeXt, BasicBlock
 # ``load_facs_data`` is expected in ``../_shared``, which does **not** exist
 # in this checkout; unlike the eScreen FACS script there is no fallback
-# cluster path here, so the import fails unless the helper is supplied.
+# fallback path here, so the import fails unless the helper is supplied.
 # ``ResNeXt_conv1_128_btnk_2dense`` is imported as a sibling module, which
 # assumes this directory is on ``sys.path`` (true when the script is run
 # from ``Analysis/benchmark/NVWACE``); it is not a package import, so

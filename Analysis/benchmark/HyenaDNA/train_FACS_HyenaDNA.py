@@ -19,8 +19,8 @@ from omegaconf.base import ContainerMetadata
 torch.serialization.add_safe_globals([ListConfig, DictConfig, ContainerMetadata])
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '_shared'))
-sys.path.insert(0, '/cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/HyenaDNA/')
-sys.path.insert(0, '/cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/')
+sys.path.insert(0, '/path/to/eScreen/code/HyenaDNA/')
+sys.path.insert(0, '/path/to/eScreen/code/')
 from standalone_hyenadna import HyenaDNAModel
 from standalone_hyenadna import HyenaFilter
 from load_facs_data import load_facs_for_cell_line
@@ -109,15 +109,14 @@ def build_hyenadna(model_name='tiny-1k-d256', device='cpu'):
 
     Notes
     -----
-    The checkpoint directory is hard-coded to an absolute cluster path
-    (``/cluster2/huanglab/...``).
+    The checkpoint directory is a placeholder path (``/path/to/...``).
 
     The saved state dict is prefixed with ``model.``, so that prefix is
     stripped before loading.  ``strict=False`` tolerates any remaining key
     mismatch, which means a partially incompatible checkpoint loads silently
     with some weights left at their initial values.
     """
-    model_path = f'/cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/HyenaDNA/pretrained_model/{model_name}/'
+    model_path = f'/path/to/eScreen/code/HyenaDNA/pretrained_model/{model_name}/'
     with open(model_path + 'config.json', 'r') as f:
         config = json.load(f)
     backbone = HyenaDNAModel(**config, use_head=False, n_classes=2)

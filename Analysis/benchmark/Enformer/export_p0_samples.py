@@ -36,9 +36,9 @@ Where it differs from the manuscript
 
 Expected on disk
 ----------------
-Input (hard-coded absolute path on the Clustered filesystem)::
+Input (placeholder absolute path)::
 
-    /cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/
+    /path/to/eScreen_training/datasets/
         TestData_20260509.randomCRE.4.pkl
 
     An 8-tuple ``(trainset, validset, testset, train_idx, valid_idx, test_idx,
@@ -65,7 +65,7 @@ warnings.filterwarnings('ignore')
 # ── Paths & Constants ──
 # Hard-coded cluster path; see the module docstring. The pickle predates
 # numpy 2.0, hence _NumpyCompatUnpickler below.
-ORIGINAL_PATH = "/cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/TestData_20260509.randomCRE.4.pkl"
+ORIGINAL_PATH = "/path/to/eScreen_training/datasets/TestData_20260509.randomCRE.4.pkl"
 # The five cell lines of the eScreen benchmark ("P0" freeze).
 P0_CELL_LINES = ['A375', 'HT29', 'HepG2', 'K562', 'hPSC']
 # WTC11 is the iPSC line; it is merged into the hPSC label so that all
