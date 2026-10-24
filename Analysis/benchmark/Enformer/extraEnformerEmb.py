@@ -25,6 +25,74 @@ Output (in {output_dir}/):
   sample_split.npy      - split label per sample (0=train, 1=valid, 2=test)
   unique_cre_split.npy  - split label per unique CRE (same order as cre_info)
   embeddings.memmap     - float32 memmap (N_unique, 4, 3072)
+
+What this script implements
+---------------------------
+The Enformer embedding extraction used for the "genomic block embedding
+finetune" strategy of Supplementary Methods §6.2.1. The paper's intent is: take
+a DNA window around each CRE, run Enformer once, and keep the trunk (pre-output-
+head) activation at the bins covering the CRE as a fixed feature vector, which a
+small MLP head then maps to the CRE-activity label (see
+``train_enformer_emb_new.py``).
+
+Rather than one Enformer call per CRE, this implementation makes one call per
+114,688 bp *patch* and reuses the result for every CRE that falls in it — hence
+"patch-based". That is a throughput optimisation, and it also makes the
+train/valid/test split spatial: CREs that share a patch necessarily share a
+split, which removes the train/test leakage that a per-CRE split would allow for
+neighbouring elements.
+
+Where the code and the manuscript disagree
+------------------------------------------
+§6.2.1 states that the CRE-centred variant extends 131,072 bp on each side and the
+genomic-block variant 262,144 bp on each side. Neither number appears here: the
+code uses Enformer's native receptive field, 393,216 bp total, arranged as
+``139,264 | 114,688 | 139,264`` so that the patch is exactly the model's centred
+bin grid. The manuscript's numbers are not reachable with this bin geometry, so
+treat the paper's flank sizes as describing a different (earlier) run.
+
+Also note that this script does **not** read the P0-filtered CSV produced by
+``export_p0_samples.py``. It re-derives the same sample filter from the original
+pickle (``RRA < 0.5``, shared across >= 2 cell lines, the five P0 lines) and then
+replaces the 7:2:1 identifier-level split with its own patch/block split. The two
+ways of building the benchmark therefore have to be kept in sync by hand: change
+the filter in one script and the sample counts will silently diverge.
+
+Expected on disk
+----------------
+Inputs (all hard-coded absolute paths on the authors' cluster; adjust before
+rerunning anywhere else)::
+
+    /cluster/huanglab/sluo/sluoo/escreen/eScreen_training/datasets/
+        TestData_20260509.randomCRE.4.pkl      # 8-tuple eScreen bundle
+    /cluster2/huanglab/liquan/genome_ref/hg38.fa            # pyfaidx FASTA
+    /cluster2/huanglab/liquan/data/eSCREEN/ANLYSIS/code/Enformer/enformer_model
+        # TensorFlow SavedModel of Enformer (tf.keras.models.load_model)
+
+Outputs, in ``{script_dir}/enformer_embeddings/``::
+
+    cre_info.npy          structured (cre_id, chr, start, end, emb_idx)
+    cre_to_emb_idx.pkl    dict cre_id -> memmap row
+    sample_cre_ids.npy    CRE id per P0-filtered sample
+    sample_split.npy      int8 split per sample: 0=train, 1=valid, 2=test
+    unique_cre_split.npy  int8 split per unique CRE (same order as cre_info)
+    embeddings.memmap     float32 (n_unique, 4, 3072), ~5.9 GB for 122k CREs
+
+Usage::
+
+    python extraEnformerEmb.py                  # main process + one worker
+    python extraEnformerEmb.py --worker --gpu 1 \
+        --cre_info ... --memmap ... --n_total ...
+
+The main process computes the split and pre-allocates the memmap, then shells out
+to itself with ``--worker``; a single worker on GPU 1 fills the shared memmap.
+The subprocess design keeps TensorFlow out of the coordinating process, which
+otherwise holds the whole embedding dict and the FASTA handle.
+
+External dependencies not vendored in this repository: ``tensorflow`` (2.x),
+``pyfaidx``, and the Enformer SavedModel itself. The Enformer implementation is
+*not* part of this repo — it is the ``enformer_model`` directory produced by the
+upstream ``enformer``/``basenji`` project.
 """
 
 import argparse
@@ -69,6 +137,23 @@ SPLIT_LABELS = {'train': 0, 'valid': 1, 'test': 2}
 
 # ── Numpy compat (old pickle format) ────────────────────
 class _NumpyCompatUnpickler(pickle.Unpickler):
+    """Unpickler that rewrites ``numpy._core`` module paths to ``numpy.core``.
+
+    The original eScreen bundle was pickled under a different numpy major version
+    than the one used for extraction. numpy >= 2.0 moved the C-extension modules
+    to ``numpy._core``; rewriting the prefix on load lets the same pickle be read
+    in either environment without pinning numpy.
+
+    Parameters
+    ----------
+    Inherits ``pickle.Unpickler``'s constructor (a file-like object).
+
+    Notes
+    -----
+    Only the module prefix is rewritten; numpy kept ``numpy.core`` as a
+    compatibility alias, so the resolved classes are identical.
+    """
+
     def find_class(self, module, name):
         if module.startswith('numpy._core'):
             module = 'numpy.core' + module[len('numpy._core'):]
@@ -80,7 +165,23 @@ class _NumpyCompatUnpickler(pickle.Unpickler):
 # ══════════════════════════════════════════════════════════
 
 def load_original_data():
-    """Load the original 8-tuple pickle."""
+    """Load the original 8-tuple pickle.
+
+    Returns
+    -------
+    tuple
+        The first eight elements of the bundle:
+        ``(trainset, validset, testset, train_idx, valid_idx, test_idx,
+        cre_sub, final_df)``. Only ``*_idx`` (positions into ``cre_sub``) and
+        ``cre_sub`` itself are used downstream; the three dataset dicts are read
+        for their ``"length"`` keys in the log line only.
+
+    Notes
+    -----
+    Uses :class:`_NumpyCompatUnpickler` so the file loads under both numpy 1.x
+    and 2.x. Slice ``[:8]`` is defensive: older exports carried extra trailing
+    objects.
+    """
     print(f'[Data] Loading original 8-tuple from {ORIGINAL_PATH}')
     with open(ORIGINAL_PATH, 'rb') as f:
         bundle = _NumpyCompatUnpickler(f).load()
@@ -92,11 +193,42 @@ def get_unique_cre_data():
     Full pipeline: load → filter → P0 → dedup by CRE id.
     No id-level train/val/test split (replaced by patch-level split later).
 
-    Returns:
-      unique_cre      — DataFrame (id, chr, start, end) one row per unique CRE
-      cre_to_emb      — dict  cre_id → embedding row index
-      sample_cre_ids  — ndarray  CRE id of each P0-filtered sample
-      p0_meta         — DataFrame of all P0-filtered samples
+    Parameters
+    ----------
+    None
+        All paths come from module-level constants (hard-coded cluster paths).
+
+    Returns
+    -------
+    unique_cre : pandas.DataFrame
+        Columns ``id``, ``chr``, ``start``, ``end``; one row per unique CRE id,
+        ordered by first appearance so that row *i* is embedding row *i*.
+    cre_to_emb : dict of str to int
+        ``cre_id -> row index`` into the embedding memmap.
+    sample_cre_ids : numpy.ndarray
+        CRE id of every P0-filtered *sample* (a CRE can appear once per cell
+        line), in the same order as ``p0_meta``.
+    p0_meta : pandas.DataFrame
+        The filtered rows of ``cre_sub`` including ``label``, ``RRA`` and
+        ``cell_line``.
+
+    Notes
+    -----
+    Shorthand for the four return values, as originally written::
+
+        unique_cre      — DataFrame (id, chr, start, end) one row per unique CRE
+        cre_to_emb      — dict  cre_id → embedding row index
+        sample_cre_ids  — ndarray  CRE id of each P0-filtered sample
+        p0_meta         — DataFrame of all P0-filtered samples
+
+    * "Deduplicate by CRE id" keeps the first row per id, so ``start``/``end`` are
+      taken from whichever cell line happened to come first. The interval is
+      identical across cell lines in this dataset, so this is safe here, but it
+      is an identity assumption, not a checked one.
+    * No train/valid/test split happens here; that is
+      :func:`create_patch_split`'s job. This function only defines the pool.
+    * ``p0_meta`` still carries the original ``cre_sub`` index, which
+      ``train_enformer_emb_new.py`` relies on when it re-derives the same rows.
     """
     # 1. Load
     trainset_o, validset_o, testset_o, train_idx, valid_idx, test_idx, cre_sub, final_df = \
@@ -157,9 +289,54 @@ def create_patch_split(unique_cre, seed=SPLIT_SEED):
        Block CRE cap ≈ 5% of total for good splitting granularity.
     3. Greedy-assign each block to train/val/test using deficit maximisation.
 
-    Returns:
-      cre_to_split  — dict  cre_id → 'train'|'valid'|'test'
-      split_counts  — dict  split_name → int count
+    Parameters
+    ----------
+    unique_cre : pandas.DataFrame
+        Output of :func:`get_unique_cre_data`; needs ``id``, ``chr``, ``start``.
+    seed : int, optional
+        Seed for the block-order shuffle. Defaults to :data:`SPLIT_SEED` (42),
+        matching the identifier-level split used elsewhere in the benchmark.
+
+    Returns
+    -------
+    cre_to_split : dict of str to str
+        ``cre_id -> 'train' | 'valid' | 'test'``.
+    split_counts : dict of str to int
+        Realised CRE counts per split (not exactly 70/20/10 — see Notes).
+
+    Notes
+    -----
+    Shorthand for the two return values, as originally written::
+
+        cre_to_split  — dict  cre_id → 'train'|'valid'|'test'
+        split_counts  — dict  split_name → int count
+
+    Three levels of granularity, from finest to coarsest:
+
+    1. **Patch** — a fixed 114,688 bp tile, ``start // PATCH_SIZE``. Each patch
+       maps 1:1 onto Enformer's 896 output bins, so one inference serves every
+       CRE in the patch.
+    2. **Block** — consecutive patches on one chromosome, greedily accumulated
+       until adding another patch would exceed ``5%`` of all CREs. The cap trades
+       split granularity against block count; it is a heuristic, not a manuscript
+       parameter.
+    3. **Split** — blocks are shuffled with ``seed`` and sorted large-first, then
+       each block goes to whichever split has the largest remaining deficit
+       (``target - current``). This greedy "deficit maximisation" gets close to
+       7:2:1 without ever splitting a block.
+
+    Consequences worth knowing:
+
+    * The realised ratios are approximate and depend on block sizes; a single
+      huge block can overshoot a target by several percent.
+    * Because assignment is spatial, a chromosome can contribute to all three
+      splits. Leakage across splits is prevented at the patch level, not the
+      chromosome level, unlike the chromosome-held-out scheme in Supplementary
+      Methods §2.3.3. CREs in *adjacent* patches can therefore still share
+      long-range regulatory context.
+    * Patch membership is decided by the CRE *start* only, so a CRE straddling a
+      patch boundary is assigned to the patch containing its start; the 4
+      embedded bins are then clamped inside the patch in :func:`worker`.
     """
     total = len(unique_cre)
 
@@ -238,7 +415,38 @@ def create_patch_split(unique_cre, seed=SPLIT_SEED):
 # ══════════════════════════════════════════════════════════
 
 def one_hot_encode_dna(sequence, dtype=np.float32):
-    """One-hot encode DNA string via uint8 lookup table."""
+    """One-hot encode DNA string via uint8 lookup table.
+
+    Parameters
+    ----------
+    sequence : str
+        DNA sequence, any case; nucleotides other than A/C/G/T are treated as
+        unknown.
+    dtype : numpy.dtype, optional
+        Output dtype, ``float32`` by default because that is what Enformer's
+        input placeholder expects.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(len(sequence), 4)``, channel order ``A, C, G, T``. Rows for
+        ``N`` (and any other non-ACGT byte) are all zeros.
+
+    Notes
+    -----
+    * The lookup table is indexed directly by the ASCII byte of each character,
+      which is much faster than a per-base dict or ``np.eye`` gather on 393 kb
+      sequences — this function is called once per patch, i.e. ~1.6 M bases per
+      batch of 4.
+    * ``table`` has only 255 rows (``np.iinfo(np.uint8).max``), so any byte
+      >= 255 would index out of range; DNA strings (plus ``N``) never reach that,
+      but a stray non-ASCII character would raise rather than be silently
+      zeroed.
+    * Row 0 of the table stays all-zero, which is what makes unmapped characters
+      encode as "unknown" for free.
+    * ``.upper()`` is applied before encoding so soft-masked (lowercase) FASTA
+      does not silently become all-zero.
+    """
     alphabet = 'ACGT'
     neutral = 'N'
 
@@ -255,6 +463,36 @@ def extract_sequence(fasta, chrom, start_0based, end_0based):
     """
     Extract DNA sequence from reference genome (pyfaidx).
     Pads with N at chromosome boundaries.
+
+    Parameters
+    ----------
+    fasta : pyfaidx.Fasta
+        Indexed hg38.
+    chrom : str
+        Chromosome name, e.g. ``'chr7'``.
+    start_0based, end_0based : int
+        Requested interval, 0-based half-open. Values outside the chromosome are
+        allowed; the out-of-range part becomes ``N``.
+
+    Returns
+    -------
+    str
+        Sequence of length ``end_0based - start_0based`` (always exact, because
+        the missing flanks are padded).
+
+    Notes
+    -----
+    * **Coordinate conversion**: pyfaidx's ``get_seq`` takes 1-based *inclusive*
+      bounds, while everything in this pipeline is 0-based half-open. Hence
+      ``trimmed_start + 1`` on the left and plain ``trimmed_end`` on the right —
+      the off-by-one is intentional, not a bug.
+    * ``max(-start_0based, 0)`` / ``max(end_0based - chrom_length, 0)`` compute
+      the padding on each side; both are 0 when the window is fully inside the
+      chromosome.
+    * The padding keeps the returned length constant, which matters because the
+      caller stacks sequences into a fixed ``(B, 393216, 4)`` array and because
+      the patch-to-bin mapping assumes the window start is ``patch_start -
+      FLANK`` regardless of clipping.
     """
     chrom_length = len(fasta[chrom])
     trimmed_start = max(start_0based, 0)
@@ -277,6 +515,56 @@ def worker(gpu_id, cre_info_path, memmap_path, n_total):
     Each patch (114688bp) gets ONE Enformer inference.  All CREs in that
     patch share the result.  For each CRE we determine its 4 output bins
     (left-aligned) and extract the corresponding embedding slices.
+
+    Parameters
+    ----------
+    gpu_id : int
+        Physical GPU index, exported as ``CUDA_VISIBLE_DEVICES`` before
+        TensorFlow is imported (import order matters — TF must not be imported
+        by the parent process first).
+    cre_info_path : str
+        ``cre_info.npy`` written by :func:`main`: structured array with fields
+        ``cre_id``, ``chr``, ``start``, ``end``, ``emb_idx``.
+    memmap_path : str
+        Pre-allocated ``float32`` memmap, ``(n_total, 4, 3072)``, opened in
+        ``r+`` mode and written in place.
+    n_total : int
+        Number of unique CREs, i.e. the memmap's first dimension.
+
+    Returns
+    -------
+    None
+        Results are written into the memmap; the parent process reads them after
+        the subprocess exits.
+
+    Notes
+    -----
+    * **Graph surgery.** The SavedModel is a full Enformer (trunk + heads). To get
+      the trunk embedding, the code traces the concrete function, digs the inner
+      ``StatefulPartitionedCall`` graph out of it, re-imports that graph, and
+      prunes it to the single tensor ``seqnn/trunk/final_pointwise/mul_1:0``.
+      That tensor name is Enformer-internal and will break if the upstream model
+      is re-exported with different layer names. The pruned function is then
+      called with the sequence plus the concrete function's captured inputs.
+    * **Bin mapping.** The 114,688 bp patch corresponds exactly to the middle 896
+      of Enformer's 896 bins (1 bin = 128 bp), because the patch is centred
+      inside the 393,216 bp input. For a CRE, ``rel_start = cstart -
+      patch_start`` and ``b_start = rel_start // BIN_WIDTH``; four consecutive bins
+      are taken left-aligned. ``4 bins * 128 bp = 512 bp``, matching the eScreen
+      input length, so the embedding covers the same footprint as the sequence the
+      other models see.
+    * **Spans-5-bins case.** A CRE whose 512 bp window is not 128 bp aligned can
+      cover five bins; the original per-CRE approach dropped the rightmost bin,
+      and this code instead clamps ``b_start`` into
+      ``[0, PATCH_BINS - 4]``, which has the same effect at the patch interior and
+      additionally prevents a negative or past-the-end slice at patch edges.
+    * `processed % 5000 == 0` is tested against the cumulative CRE counter inside
+      the per-patch loop, so the progress line can print several times for one
+      batch or be skipped entirely depending on how many CREs each patch holds.
+    * Batches are formed from a plain ``list(patch_groups.items())``; dict order is
+      insertion order, i.e. CRE order in ``cre_info``. There is no shuffling and no
+      resume: a crash restarts from the first patch, and the memmap is partially
+      filled.
     """
     os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'

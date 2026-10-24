@@ -11,6 +11,57 @@ Pipeline (from AlphaGenome_perturbation_FACS.ipynb):
 
 Usage:
     python run_facs_perturbation.py
+
+What this script implements
+---------------------------
+Generation of the AlphaGenome perturbation predictions used by the FACS
+readout-specific evaluation in Supplementary Methods §5.5 (K562 and hPSC). For
+each CRE, a 1 Mb window centred on the CRE summit is sent to the hosted
+AlphaGenome API three times — unperturbed (WT), with the central 512 bp masked by
+``N`` (MASK), and with the central 512 bp shuffled (SHUFFLE) — using the CAGE
+output head and the cell line's ontology term.
+
+This matches §5.5's description ("a 1 Mb genomic window centered on the CRE
+summit was extracted, and its central 512 bp ... was either replaced with Ns
+(masking) or randomly shuffled"). Note that §6.2.2 describes the same experiment
+with an RNA-seq readout, while both the manuscript's §5.5 text and this code use
+the CAGE head.
+
+AlphaGenome is not vendored: inference is remote, through the ``alphagenome``
+package and the hard-coded API keys in ``alphagenome_common``. No local
+checkpoint exists.
+
+Expected on disk
+----------------
+``data/FACS_fluorescence_dataset.txt`` (input)
+    Tab-separated FACS CRE table with ``id``, ``chr``, ``start``, ``end``,
+    ``cell_line``, ``RRA``. ``start``/``end`` are the CRE interval (0-based,
+    half-open) and the summit is approximated by the midpoint.
+``data/hg38.fa`` (input)
+    Indexed hg38 for :mod:`pyfaidx`.
+``data/AlphaGenome_FACS_perturbation.h5`` (output)
+    ``/cage/<id>@<cell_line>/{wt,mask,shuffle}`` (``float16``, one value per CAGE
+    bin) with attributes ``chr``, ``start``, ``end``, ``cell_line``.
+``data/checkpoint_FACS_perturb.pkl`` (output, transient)
+    Pickled ``processed``/``failed`` index sets; deleted automatically once every
+    sample is done.
+
+Order of use: run this script first, then ``analyze_facs_scores.py``.
+
+Deviations and rough edges
+--------------------------
+* The HDF5 attribute is ``chr`` here but ``chromosome`` in
+  ``run_escreen_perturbation.py``; the two producers are not interchangeable.
+* ``CheckpointManager.mark_processed`` is called with ``rw.name`` — the pandas
+  *index label*, not the CRE id. It happens to be the correct integer because the
+  table is read with the default ``RangeIndex`` and re-indexed with
+  ``cre_df.iloc[pending_idx]``; it would silently record the wrong indices if the
+  input file ever carried a non-default index.
+* If there is nothing left to do, the early branch prints "All samples already
+  processed!" and returns without closing the HDF5 handle (the ``finally`` only
+  guards the prediction branch), so on Windows the subsequent checkpoint cleanup
+  can fail with a sharing violation. Closing the file before ``cleanup`` would
+  fix it.
 """
 import os
 import time
@@ -31,7 +82,32 @@ CHECKPOINT_FILE = 'data/checkpoint_FACS_perturb.pkl'
 
 
 def build_cre_df(csv_path='data/FACS_fluorescence_dataset.txt', sep='\t'):
-    """Load the FACS dataset, build a 1 Mb window per CRE."""
+    """Load the FACS dataset, build a 1 Mb window per CRE.
+
+    Parameters
+    ----------
+    csv_path : str, optional
+        Tab-separated FACS CRE table.
+    sep : str, optional
+        Field separator; tab for the shipped file.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The input table plus ``begin`` / ``stop``: 0-based half-open bounds of a
+        1,048,576 bp window centred on the CRE midpoint. Bounds are unclipped and
+        may be negative or past the chromosome end; padding happens later.
+
+    Notes
+    -----
+    * The summit is taken as ``(start + end) // 2`` (integer division, so the
+      window start is biased one bp left for odd-length CREs). Supplementary
+      Methods §5.5 says "centred on the CRE summit"; the midpoint is used because
+      no summit column is stored in this table.
+    * ``.astype(int)`` is applied to the midpoint because an all-NaN or float
+      column would otherwise propagate floats into the row ``begin``/``stop``
+      values and from there into HDF5 attributes.
+    """
     cre_df = pd.read_csv(csv_path, sep=sep)
     print(f'Total CREs: {len(cre_df)}')
     print(cre_df['cell_line'].value_counts())
@@ -44,7 +120,31 @@ def build_cre_df(csv_path='data/FACS_fluorescence_dataset.txt', sep='\t'):
 
 
 def main():
-    """Main loop: predict WT/MASK/SHUFFLE per batch into HDF5, resumable."""
+    """Main loop: predict WT/MASK/SHUFFLE per batch into HDF5, resumable.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    * Resumption is doubly guarded: the HDF5 group keys are re-synced into the
+      checkpoint at start-up (so a lost pickle costs nothing), and
+      ``get_pending_indices`` returns the still-failed indices first, so a
+      resumed run retries the samples that broke before spending API quota on
+      fresh ones.
+    * Batching is grouped by cell line for the same reason as in
+      ``run_escreen_perturbation.py``: the ontology term is taken from the first
+      row of the batch and assumed homogeneous.
+    * ``mark_processed(rw.name)`` records the pandas index label. It coincides
+      with the row position only because the table is read with a default
+      ``RangeIndex``; see the module docstring.
+    * The keyboard-interrupt handler saves progress by relying on the checkpoint
+      writes already performed; there is no final flush of unsaved samples
+      because each sample is written to HDF5 as soon as its batch returns.
+    * ``CheckpointManager.cleanup`` runs after the file is closed, which is what
+      lets the pickle be deleted on Windows when the run completes.
+    """
     # Create models
     model1, model2, model3 = create_models()
     print('Models created:', model1, model2, model3)
