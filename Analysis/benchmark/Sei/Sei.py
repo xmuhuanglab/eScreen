@@ -11,7 +11,7 @@ Supplementary Methods §6.2 covers Enformer (§6.2.1), AlphaGenome (§6.2.2),
 HyenaDNA (§6.2.3), LegNet/Dream-CNN/Dream-RNN (§6.2.4) and
 DeepSEA/NvwaCE/Malinois (§6.2.5); there is no Sei section, so none of the layer
 widths, dilations or spline settings below can be attributed to the paper.
-Treat them as upstream Sei defaults.
+They are the upstream Sei defaults.
 
 What is actually used
 ---------------------

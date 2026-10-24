@@ -92,8 +92,7 @@ from alphagenome_common import (
 OUTPUT_H5 = 'data/AlphaGenome_FACS_perturbation.h5'
 SCORE_CSV = 'data/AlphaGenome_FACS_perturbation_scores.csv'
 # Declared but never read in this script: the FACS runs resume from the HDF5
-# itself (see run_facs_perturbation.py), so this path is vestigial. Adjust the
-# two paths above if rerunning on another machine.
+# itself (see run_facs_perturbation.py), so this path is vestigial.
 CHECKPOINT_FILE = 'data/checkpoint_FACS_perturb.pkl'
 
 

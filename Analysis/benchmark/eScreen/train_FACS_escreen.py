@@ -296,7 +296,7 @@ def train_facs(cell_line, device='cuda:0', epochs=50, batch_size=256,
     cell_line : {'K562', 'hPSC'}
         FACS cell line to train; each line gets its own model.
     device : str, default 'cuda:0'
-        Torch device string (hard-coded default; adjust for other hosts).
+        Torch device string (hard-coded default).
     epochs : int, default 50
         Maximum number of passes over the training split.
     batch_size : int, default 256

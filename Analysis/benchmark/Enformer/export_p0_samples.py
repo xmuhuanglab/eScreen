@@ -187,7 +187,7 @@ meta['_pool_idx'] = np.arange(len(pool_index))
 # is what removes ambiguous negatives — a CRE with mediocre RRA might simply not
 # have been assayed well, whereas RRA < 0.5 is strong evidence of no activity.
 is_bottom_neg = (meta['label'] == 0) & (meta['RRA'] < RRA_BOTTOM)
-# Keep only CRE ids that are bottom negatives in >= 2 cell lines: cross-cell-line
+# Retains only CRE ids that are bottom negatives in >= 2 cell lines: cross-cell-line
 # agreement is the manuscript's criterion for an unambiguous negative (§2.3.4).
 shared_ids = (
     meta.loc[is_bottom_neg]
